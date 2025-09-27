@@ -1,0 +1,7 @@
+streamlit>=1.22
+pandas
+numpy
+rapidfuzz
+python-dotenv
+azure-identity
+openai
