@@ -281,14 +281,17 @@ class AOAI:
 
     # Embeddings (batched)
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        out: List[List[float]] = []
-        B = 64
-        for i in range(0, len(texts), B):
-            chunk = texts[i:i+B]
-            resp = self.client.embeddings.create(model=self.emb_deploy, input=chunk)
-            for d in resp.data:
-                out.append(d.embedding)
-        return out
+        try:
+            out: List[List[float]] = []
+            B = 64
+            for i in range(0, len(texts), B):
+                chunk = texts[i:i+B]
+                resp = self.client.embeddings.create(model=self.emb_deploy, input=chunk)
+                for d in resp.data:
+                    out.append(d.embedding)
+            return out
+        except Exception as e:
+            raise RuntimeError(f"Embedding error: {e}")
 
     # Tool-calling LLM
     def judge_matches(
@@ -1251,19 +1254,12 @@ def main():
                 ("a1", "ACME Corp"),
                 ("a2", "ACME Corp"),
                 ("a3", "Acme Corporation"),
-                ("a4", "ACME Corp International"),
-                ("a5", "ACME Corp Int"),
-                ("g1", "ACME Global Holdings Public Ltd Company"),
-                ("g2", "ACME Global Holdings Public Limited Company"),
-                ("f1", "Globex I Logistics"),
-                ("f2", "Globex International Logistics"),
-                ("f3", "Globex Int Log"),
-                ("b1", "Globex LLC"),
-                ("b2", "Globex, L.L.C."),
-                ("b3", "Globex I"),
-                ("x1", "Unrelated Co"),
+                ("f1", "Globex International Logistics"),
+                ("b1", "Globex, LLC"),
+                ("v1", "Unrelated Co"),
                 ("x2", "Loblaws Ltd"),
-                ("x3", "Loblows"),
+                ("d1", "Microsoft"),
+                ("d2", "Microsoft Corporation"),
                 ], columns=["account_id","account_name"])
                 write_csv(accounts_df, DEMO_ACCOUNTS_PATH)
 
@@ -1282,19 +1278,12 @@ def main():
                 ("a1", "ACME Corp"),
                 ("a2", "ACME Corp"),
                 ("a3", "Acme Corporation"),
-                ("a4", "ACME Corp International"),
-                ("a5", "ACME Corp Int"),
-                ("g1", "ACME Global Holdings Public Ltd Company"),
-                ("g2", "ACME Global Holdings Public Limited Company"),
-                ("f1", "Globex I Logistics"),
-                ("f2", "Globex International Logistics"),
-                ("f3", "Globex Int Log"),
-                ("b1", "Globex LLC"),
-                ("b2", "Globex, L.L.C."),
-                ("b3", "Globex I"),
-                ("x1", "Unrelated Co"),
+                ("f1", "Globex International Logistics"),
+                ("b1", "Globex, LLC"),
+                ("v1", "Unrelated Co"),
                 ("x2", "Loblaws Ltd"),
-                ("x3", "Loblows"),
+                ("d1", "Microsoft"),
+                ("d2", "Microsoft Corporation"),
             ], columns=["account_id","account_name"])
 
     # prefer CLI > env defaults

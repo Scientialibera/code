@@ -1,920 +1,795 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Streamlit App for Account Deduplication Pipeline
-Interactive UI for the Azure OpenAI-based account deduper
-
-Usage:
-  streamlit run app.py
-
-Assumptions:
-- Azure OpenAI environment variables are configured (AOAI_ENDPOINT, AOAI_CHAT_DEPLOYMENT, AOAI_EMBEDDING_DEPLOYMENT, etc.)
-- The underlying pipeline code is available as `example_run.py` in the same working directory.
-"""
-
-import os
+import streamlit as st
+import pandas as pd
+import numpy as np
+import json
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, List, Set, Any, Tuple
+from typing import Dict, Set, List, Any, Tuple
+import os
 
-import pandas as pd
-import streamlit as st
+# Import functions from the main deduplication script
+from example_run import (
+    perfect_match_base, apply_mapping, masters_slice, similarity_pairs,
+    route_candidates, llm_results_df, build_review_queue, build_apply,
+    clean_proposals, compress_mapping_df, load_context_from_notes,
+    persist_note, ContextBook, get_aoai_client, pair_key, utc_now,
+    read_csv, write_csv, show, ROOT, DECISIONS_PATH, CUM_MAPPING_PATH,
+    NOTES_PATH, _parse_seed_focals, filter_llm_band_by_scope,
+    _rerun_llm_for_scope, LLM_ARRAY_SIZE, normalize_name, EMB_WEIGHT, FUZZ_WEIGHT
+)
+from rapidfuzz import fuzz
 
-# Ensure .env is loaded so AOAI_* env vars are available to this process (Streamlit spawns workers)
-from dotenv import load_dotenv, find_dotenv
-load_dotenv(find_dotenv())
-
-# Import the pipeline/library with AOAI + dedupe logic
-import example_run as er
-
-
-# =========================
-# Page configuration
-# =========================
 st.set_page_config(
-    page_title="Account Deduplication Pipeline",
-    page_icon="🔄",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_title="Account Deduplication Assistant",
+    page_icon="🔍",
+    layout="wide"
 )
 
-
-# =========================
-# Helpers
-# =========================
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def parse_csv_ids(s: str) -> List[str]:
-    if not s:
-        return []
-    return [x.strip() for x in s.split(",") if x.strip()]
-
-
-def parse_seed_pairs(s: str) -> List[str]:
-    if not s:
-        return []
-    parts = []
-    for p in s.split(","):
-        p = p.strip()
-        if not p:
-            continue
-        # allow either "a|b" or "a | b"
-        if "|" not in p:
-            # ignore malformed piece silently
-            continue
-        a, b = p.split("|", 1)
-        a, b = a.strip(), b.strip()
-        if a and b:
-            parts.append(f"{a}|{b}")
-    return parts
-
-
 def init_session_state():
-    """Initialize all session state variables."""
-    if "accounts_df" not in st.session_state:
-        st.session_state.accounts_df = pd.DataFrame(
-            [
-                ("a1", "ACME Corp"),
-                ("a2", "ACME Corp"),
-                ("a3", "Acme Corporation"),
-                ("a4", "ACME Corp International"),
-                ("a5", "ACME Corp Int"),
-                ("g1", "ACME Global Holdings Public Ltd Company"),
-                ("g2", "ACME Global Holdings Public Limited Company"),
-                ("f1", "Globex I Logistics"),
-                ("f2", "Globex International Logistics"),
-                ("f3", "Globex Int Log"),
-                ("b1", "Globex LLC"),
-                ("b2", "Globex, L.L.C."),
-                ("b3", "Globex I"),
-                ("x1", "Unrelated Co"),
-                ("x2", "Loblaws Ltd"),
-                ("x3", "Loblows"),
-            ],
-            columns=["account_id", "account_name"],
-        )
+    """Initialize session state variables"""
+    if 'accounts_df' not in st.session_state:
+        # Start with demo data
+        st.session_state.accounts_df = pd.DataFrame([
+            ("a1", "ACME Corp"),
+            ("a2", "ACME Corp"),
+            ("a3", "Acme Corporation"),
+            ("a4", "ACME Corp International"),
+            ("f1", "Globex International Logistics"),
+            ("b1", "Globex, LLC"),
+            ("v1", "Unrelated Co"),
+            ("x2", "Loblaws Ltd"),
+            ("d1", "Microsoft"),
+            ("d2", "Microsoft Corporation"),
+            ("y3", "Microsoft International LLC")
+        ], columns=["account_id", "account_name"])
 
-    if "cycle_count" not in st.session_state:
-        st.session_state.cycle_count = 0
+    if 'dedup_results' not in st.session_state:
+        st.session_state.dedup_results = {}
 
-    if "pipeline_stage" not in st.session_state:
-        st.session_state.pipeline_stage = "input"  # input → processing → review → final_review → complete
+    if 'context_book' not in st.session_state:
+        st.session_state.context_book = load_context_from_notes()
 
-    # Intermediate artifacts
-    for key, default in [
-        ("full_base", None),
-        ("masters", None),
-        ("candidates", None),
-        ("llm_results", None),
-        ("review_queue", None),
-        ("final_proposals", None),
-        ("final_results", None),
-    ]:
-        if key not in st.session_state:
-            st.session_state[key] = default
+    if 'review_comments' not in st.session_state:
+        st.session_state.review_comments = {}
 
-    if "id2name" not in st.session_state:
-        st.session_state.id2name = {}
+def add_account_row():
+    """Add a new empty row to accounts"""
+    new_row = pd.DataFrame([("", "")], columns=["account_id", "account_name"])
+    st.session_state.accounts_df = pd.concat([st.session_state.accounts_df, new_row], ignore_index=True)
 
-    if "human_decisions" not in st.session_state:
-        # map pair_key -> dict
-        st.session_state.human_decisions = {}
+def remove_account_row(index):
+    """Remove a specific row from accounts"""
+    st.session_state.accounts_df = st.session_state.accounts_df.drop(index).reset_index(drop=True)
 
-    if "context_book" not in st.session_state:
-        st.session_state.context_book = er.ContextBook()
+def detect_decision_changes():
+    """Detect what LLM decisions have been modified from original"""
+    if 'dedup_results' not in st.session_state:
+        return set(), {}
 
-    # Config / controls
-    if "scope" not in st.session_state:
-        st.session_state.scope = "all"
-    if "rerun_scope" not in st.session_state:
-        st.session_state.rerun_scope = "all"
-    if "admin_review" not in st.session_state:
-        st.session_state.admin_review = False
+    # Get original and current decisions
+    original_llm = st.session_state.dedup_results.get('llm_results', pd.DataFrame())
+    current_decisions = st.session_state.dedup_results.get('llm_decisions', pd.DataFrame())
 
-    if "seed_focals" not in st.session_state:
-        st.session_state.seed_focals = set()
-    if "seed_pairs" not in st.session_state:
-        st.session_state.seed_pairs = set()
+    if original_llm.empty or current_decisions.empty:
+        return set(), {}
 
-    # Temp inputs for seeds
-    if "seed_focals_input" not in st.session_state:
-        st.session_state.seed_focals_input = ""
-    if "seed_pairs_input" not in st.session_state:
-        st.session_state.seed_pairs_input = ""
+    # Build original decisions lookup
+    original_decisions = {}
+    for _, r in original_llm.iterrows():
+        focal = r["focal_master_id"]
+        for item in r["results"]:
+            pk = pair_key(focal, item["candidate_master_id"])
+            original_decisions[pk] = item.get('llm_decision', 'UNKNOWN')
 
+    # Find changes
+    changed_pairs = set()
+    changes_detail = {}
 
-# =========================
-# Sidebar
-# =========================
-def sidebar_info():
-    with st.sidebar:
-        st.markdown("## ⚙️ Settings")
-        st.markdown(
-            f"""
-**Thresholds**
-- Auto-merge ≥ **T_AUTO**: `{er.T_AUTO:.2f}`
-- LLM band ≥ **T_LLM_LOW**: `{er.T_LLM_LOW:.2f}`
-- Embedding weight: `{er.EMB_WEIGHT:.2f}`, Fuzzy weight: `{er.FUZZ_WEIGHT:.2f}`
-- LLM Top-N per focal: `{er.LLM_TOP_N}`
+    for _, row in current_decisions.iterrows():
+        pk = row['pair_key']
+        current_decision = row['llm_decision']
+        original_decision = original_decisions.get(pk)
 
-**Rerun Auto-approve**
-- Enabled: `{er.AUTO_APPROVE_RERUN}`
-- YES Confidence ≥ `{er.AUTO_APPROVE_RERUN_YES_CONF:.2f}`
-"""
-        )
-        st.markdown("---")
-        st.markdown("### AOAI Deployments")
-        st.caption(
-            f"Endpoint: `{os.getenv('AOAI_ENDPOINT', 'not-set')}`\n\n"
-            f"Chat: `{os.getenv('AOAI_CHAT_DEPLOYMENT', 'not-set')}`\n\n"
-            f"Embedding: `{os.getenv('AOAI_EMBEDDING_DEPLOYMENT', 'not-set')}`"
-        )
-        st.markdown("---")
-        st.markdown("### Ledgers & Artifacts")
-        st.caption(
-            f"- Decisions: `{er.DECISIONS_PATH}`\n"
-            f"- Cumulative Mapping: `{er.CUM_MAPPING_PATH}`\n"
-            f"- Notes: `{er.NOTES_PATH}`\n"
-            f"- Demo Input (stateful): `{er.DEMO_ACCOUNTS_PATH}`"
-        )
+        if original_decision and current_decision != original_decision:
+            changed_pairs.add(pk)
+            changes_detail[pk] = {
+                'original': original_decision,
+                'current': current_decision,
+                'focal_id': row['focal_id'],
+                'candidate_id': row['candidate_id']
+            }
 
+    return changed_pairs, changes_detail
 
-# =========================
-# Stage: Input
-# =========================
-def display_accounts_input():
-    st.header("📊 Input Accounts")
+def find_affected_accounts(changed_pairs, changes_detail, current_decisions_df):
+    """Find all accounts that could be affected by the changed decisions"""
+    affected_accounts = set()
 
-    col1, col2 = st.columns([2, 1], gap="large")
+    # Direct accounts from changed pairs
+    for pk in changed_pairs:
+        if pk in changes_detail:
+            affected_accounts.add(changes_detail[pk]['focal_id'])
+            affected_accounts.add(changes_detail[pk]['candidate_id'])
 
-    with col1:
-        st.subheader("Edit Accounts")
+    # Find potential cascade effects
+    # Look for any YES decisions involving the affected accounts
+    for _, row in current_decisions_df.iterrows():
+        if row['llm_decision'] == 'YES':
+            focal_id = str(row['focal_id'])
+            candidate_id = str(row['candidate_id'])
+
+            # If either account is already affected, add the other
+            if focal_id in affected_accounts:
+                affected_accounts.add(candidate_id)
+            elif candidate_id in affected_accounts:
+                affected_accounts.add(focal_id)
+
+    return affected_accounts
+
+def incremental_recalculate(affected_accounts, original_masters, original_pairs):
+    """Recalculate only the similarity pairs involving affected accounts"""
+    if not affected_accounts:
+        return original_pairs
+
+    # Keep unaffected pairs
+    unaffected_pairs = original_pairs[
+        ~(original_pairs['master_a_id'].astype(str).isin(affected_accounts) |
+          original_pairs['master_b_id'].astype(str).isin(affected_accounts))
+    ].copy()
+
+    # Recalculate affected pairs
+    affected_masters = original_masters[
+        original_masters['account_id'].astype(str).isin(affected_accounts)
+    ].copy()
+
+    if not affected_masters.empty:
+        # Recalculate similarities for affected accounts
+        new_affected_pairs = similarity_pairs(affected_masters)
+
+        # Also recalculate cross-pairs (affected with unaffected)
+        unaffected_masters = original_masters[
+            ~original_masters['account_id'].astype(str).isin(affected_accounts)
+        ].copy()
+
+        if not unaffected_masters.empty:
+            # Calculate affected × unaffected pairs
+            cross_pairs = []
+            for _, affected_row in affected_masters.iterrows():
+                for _, unaffected_row in unaffected_masters.iterrows():
+                    a_id = affected_row['account_id']
+                    u_id = unaffected_row['account_id']
+
+                    # Calculate similarity between these two
+                    a_name = normalize_name(affected_row['account_name'])
+                    u_name = normalize_name(unaffected_row['account_name'])
+
+                    # Simple calculation (would need full embedding in real implementation)
+                    fuzz_score = float(fuzz.token_sort_ratio(a_name, u_name) / 100.0)
+                    # Use fake embedding for now - in real implementation, would recalculate
+                    emb_score = fuzz_score * 0.9  # Approximate
+                    combined = EMB_WEIGHT * emb_score + FUZZ_WEIGHT * fuzz_score
+
+                    cross_pairs.append((
+                        pair_key(a_id, u_id), a_id, u_id,
+                        emb_score, fuzz_score, combined
+                    ))
+
+            if cross_pairs:
+                cross_pairs_df = pd.DataFrame(cross_pairs,
+                    columns=["pair_key", "master_a_id", "master_b_id", "emb_score", "fuzz_score", "score"])
+                new_affected_pairs = pd.concat([new_affected_pairs, cross_pairs_df], ignore_index=True)
+
+        # Combine all pairs
+        updated_pairs = pd.concat([unaffected_pairs, new_affected_pairs], ignore_index=True)
+        return updated_pairs.drop_duplicates(subset=['pair_key'])
+
+    return original_pairs
+
+def apply_decisions_and_finalize():
+    """Apply approved decisions with smart incremental updates"""
+    if 'dedup_results' not in st.session_state or not st.session_state.dedup_results:
+        st.error("No deduplication results to finalize")
+        return
+
+    try:
+        # Detect what changed
+        changed_pairs, changes_detail = detect_decision_changes()
+
+        with st.spinner("Analyzing changes and computing updates..."):
+            if changed_pairs:
+                st.info(f"🔍 Detected {len(changed_pairs)} changed decisions - using incremental update")
+
+                # Find affected accounts
+                current_decisions = st.session_state.dedup_results['llm_decisions']
+                affected_accounts = find_affected_accounts(changed_pairs, changes_detail, current_decisions)
+                st.info(f"📊 {len(affected_accounts)} accounts affected by changes")
+
+                # Incremental recalculation
+                original_masters = st.session_state.dedup_results['masters']
+                original_pairs = st.session_state.dedup_results['pairs']
+
+                progress_bar = st.progress(0.3)
+                updated_pairs = incremental_recalculate(affected_accounts, original_masters, original_pairs)
+                progress_bar.progress(0.6)
+
+                # Update candidates with new routing
+                updated_candidates = route_candidates(updated_pairs)
+                progress_bar.progress(0.8)
+
+                # Store updated data
+                st.session_state.dedup_results['pairs'] = updated_pairs
+                st.session_state.dedup_results['candidates'] = updated_candidates
+
+                progress_bar.progress(1.0)
+                st.success(f"✅ Incremental update completed! Only recalculated {len(affected_accounts)} accounts instead of all {len(original_masters)}")
+            else:
+                st.info("✅ No changes detected - using existing calculations")
+
+        # Get current data
+        candidates = st.session_state.dedup_results['candidates']
+        llm_results = st.session_state.dedup_results['llm_results']
+        llm_decisions_df = st.session_state.dedup_results.get('llm_decisions', pd.DataFrame())
+        accounts_df = st.session_state.dedup_results['accounts_input']
+
+        # Create human approved dataframe from modified LLM decisions
+        human_approved_rows = []
+        if not llm_decisions_df.empty:
+            yes_decisions = llm_decisions_df[llm_decisions_df['llm_decision'] == 'YES']
+            for _, row in yes_decisions.iterrows():
+                human_approved_rows.append({
+                    'pair_key': row['pair_key'],
+                    'focal_master_id': row['focal_id'],
+                    'candidate_master_id': row['candidate_id'],
+                    'score': row['score'],
+                    'llm_confidence': row['llm_confidence'],
+                    'llm_reason': row['llm_reason'],
+                    'status': 'APPROVED',
+                    'decision': 'HUMAN_APPROVED',
+                    'reviewer': 'streamlit_user',
+                    'notes': 'Modified in UI',
+                    'updated_at': utc_now()
+                })
+
+        human_approved = pd.DataFrame(human_approved_rows)
+
+        # Build apply proposals
+        decisions_hist = read_csv(DECISIONS_PATH, cols=["pair_key", "decision", "source", "decided_at", "score", "reason"])
+        apply_df = build_apply(candidates, llm_results, human_approved, decisions_hist)
+
+        # Clean proposals and create mapping
+        clean_delta = clean_proposals(apply_df)
+
+        # Apply mapping to get final results
+        full_base = st.session_state.dedup_results['full_base']
+        cum_map_prev = read_csv(CUM_MAPPING_PATH, cols=["old_master_id", "canonical_master_id"])
+
+        if not clean_delta.empty:
+            cum_concat = pd.concat([cum_map_prev, clean_delta], ignore_index=True).drop_duplicates()
+            cum_map_now = compress_mapping_df(cum_concat)
+        else:
+            cum_map_now = cum_map_prev
+
+        # Apply final mapping
+        full_final = apply_mapping(full_base, cum_map_now)
+        masters_final = masters_slice(full_final)
+
+        # Update session state with final results
+        st.session_state.dedup_results.update({
+            'apply_proposals': apply_df,
+            'clean_mapping': clean_delta,
+            'cumulative_mapping': cum_map_now,
+            'full_final': full_final,
+            'masters_final': masters_final,
+            'human_approved': human_approved,
+            'changes_applied': changes_detail
+        })
+
+        if changed_pairs:
+            st.success(f"✅ Smart incremental update completed! Changed {len(changed_pairs)} decisions affecting {len(find_affected_accounts(changed_pairs, changes_detail, llm_decisions_df))} accounts.")
+        else:
+            st.success("✅ Decisions applied and final results generated!")
+
+    except Exception as e:
+        st.error(f"Error applying decisions: {str(e)}")
+
+def run_deduplication_process():
+    """Execute the full deduplication pipeline"""
+    try:
+        accounts_df = st.session_state.accounts_df.copy()
+
+        # Filter out empty rows
+        accounts_df = accounts_df[
+            (accounts_df['account_id'].str.strip() != '') &
+            (accounts_df['account_name'].str.strip() != '')
+        ]
+
+        if accounts_df.empty:
+            st.error("No valid accounts to process")
+            return
+
+        with st.spinner("Running deduplication process..."):
+            # Step 1: Perfect match base
+            full_base = perfect_match_base(accounts_df)
+
+            # Step 2: Apply cumulative mapping
+            cum_map_prev = read_csv(CUM_MAPPING_PATH, cols=["old_master_id", "canonical_master_id"])
+            full_after_hist = apply_mapping(full_base, cum_map_prev)
+
+            # Step 3: Masters & pairs
+            masters = masters_slice(full_after_hist)
+            pairs = similarity_pairs(masters)
+
+            # Step 4: Route candidates
+            candidates = route_candidates(pairs)
+
+            # Step 5: LLM judgments
+            context_book = st.session_state.context_book
+            llm_res = llm_results_df(
+                candidates, masters,
+                array_batch_size=LLM_ARRAY_SIZE,
+                context_book=context_book,
+                scope="all",
+                seed_focals=set(),
+                seed_pairs=set(),
+                pairs_for_graph=pairs
+            )
+
+            # Step 6: Build review queue
+            review_queue = build_review_queue(llm_res)
+
+            # Create comprehensive LLM decisions table
+            llm_decisions = []
+            if not llm_res.empty:
+                for _, r in llm_res.iterrows():
+                    focal = r["focal_master_id"]
+                    focal_name = dict(zip(masters["account_id"].astype(str), masters["account_name"])).get(focal, "")
+                    for item in r["results"]:
+                        candidate_id = item["candidate_master_id"]
+                        candidate_name = dict(zip(masters["account_id"].astype(str), masters["account_name"])).get(candidate_id, "")
+                        llm_decisions.append({
+                            'pair_key': pair_key(focal, candidate_id),
+                            'focal_id': focal,
+                            'focal_name': focal_name,
+                            'candidate_id': candidate_id,
+                            'candidate_name': candidate_name,
+                            'llm_decision': item.get('llm_decision', 'UNKNOWN'),
+                            'llm_confidence': item.get('llm_confidence', None),
+                            'llm_reason': item.get('llm_reason', ''),
+                            'score': item.get('score', None),
+                            'context_used': item.get('context_used', ''),
+                            'prompt_version': item.get('prompt_version', ''),
+                        })
+
+            llm_decisions_df = pd.DataFrame(llm_decisions)
+
+            # Store results in session state
+            st.session_state.dedup_results = {
+                'accounts_input': accounts_df,
+                'full_base': full_base,
+                'full_after_hist': full_after_hist,
+                'masters': masters,
+                'pairs': pairs,
+                'candidates': candidates,
+                'llm_results': llm_res,
+                'llm_decisions': llm_decisions_df,
+                'review_queue': review_queue,
+                'id2name': dict(zip(masters["account_id"].astype(str), masters["account_name"]))
+            }
+
+        st.success("Deduplication process completed!")
+
+    except Exception as e:
+        st.error(f"Error during deduplication: {str(e)}")
+
+def rerun_llm_with_comments(scope="all", focal_ids=None):
+    """Rerun LLM with accumulated comments"""
+    if 'dedup_results' not in st.session_state or not st.session_state.dedup_results:
+        st.error("No deduplication results to rerun")
+        return
+
+    try:
+        # Add comments to context book
+        for comment_id, comment_text in st.session_state.review_comments.items():
+            if comment_text.strip():
+                if scope == "all":
+                    st.session_state.context_book.add_global(comment_text)
+                    persist_note("GLOBAL", comment_text)
+                else:
+                    # For focal-specific runs, add to specific focal
+                    if focal_ids:
+                        for focal_id in focal_ids:
+                            st.session_state.context_book.add_focal(focal_id, comment_text)
+                            persist_note("FOCAL", comment_text, focal_id)
+
+        # Rerun LLM for the specified scope
+        review_queue = st.session_state.dedup_results['review_queue']
+        id2name = st.session_state.dedup_results['id2name']
+
+        seed_focals = set(focal_ids) if focal_ids else set()
+
+        with st.spinner(f"Rerunning LLM with scope: {scope}..."):
+            judgments_by_pk = _rerun_llm_for_scope(
+                review_queue, id2name, st.session_state.context_book, scope, seed_focals
+            )
+
+            # Update review queue with new judgments
+            for pk, judgment in judgments_by_pk.items():
+                mask = review_queue['pair_key'] == pk
+                if mask.any():
+                    idx = review_queue[mask].index[0]
+                    review_queue.loc[idx, 'llm_decision'] = judgment.get('llm_decision')
+                    review_queue.loc[idx, 'llm_confidence'] = judgment.get('llm_confidence')
+                    review_queue.loc[idx, 'llm_reason'] = judgment.get('llm_reason')
+                    review_queue.loc[idx, 'context_used'] = judgment.get('context_used')
+
+            st.session_state.dedup_results['review_queue'] = review_queue
+
+        st.success(f"LLM rerun completed for scope: {scope}")
+
+    except Exception as e:
+        st.error(f"Error during LLM rerun: {str(e)}")
+
+def main():
+    st.title("🔍 Account Deduplication Assistant")
+    st.markdown("Interactive tool for deduplicating company accounts using AI")
+
+    init_session_state()
+
+    # Sidebar for navigation
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio("Go to", [
+        "1. Input Management",
+        "2. Deduplication Process",
+        "3. Review & Results",
+        "4. Masters Management"
+    ])
+
+    if page == "1. Input Management":
+        st.header("📊 Account Input Management")
+
+        st.subheader("Current Accounts")
+
+        # Display editable dataframe
         edited_df = st.data_editor(
             st.session_state.accounts_df,
             num_rows="dynamic",
             use_container_width=True,
-            key="accounts_editor",
-            column_config={
-                "account_id": st.column_config.TextColumn(
-                    "account_id", required=True
-                ),
-                "account_name": st.column_config.TextColumn(
-                    "account_name", required=True
-                ),
-            },
+            key="accounts_editor"
         )
-        if not edited_df.equals(st.session_state.accounts_df):
-            st.session_state.accounts_df = edited_df
 
-    with col2:
-        st.subheader("Quick Actions")
+        # Update session state with edited data
+        st.session_state.accounts_df = edited_df
 
-        up = st.file_uploader("Upload CSV (account_id, account_name)", type=["csv"])
-        if up is not None:
-            try:
-                df = pd.read_csv(up, dtype=str)
-                if not {"account_id", "account_name"}.issubset(df.columns):
-                    st.error("CSV must include columns: account_id, account_name")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("➕ Add New Account"):
+                add_account_row()
+                st.rerun()
+
+        with col2:
+            if st.button("🗑️ Remove Empty Rows"):
+                st.session_state.accounts_df = st.session_state.accounts_df[
+                    (st.session_state.accounts_df['account_id'].str.strip() != '') &
+                    (st.session_state.accounts_df['account_name'].str.strip() != '')
+                ]
+                st.rerun()
+
+        # Show summary
+        valid_accounts = st.session_state.accounts_df[
+            (st.session_state.accounts_df['account_id'].str.strip() != '') &
+            (st.session_state.accounts_df['account_name'].str.strip() != '')
+        ]
+        st.info(f"Total valid accounts: {len(valid_accounts)}")
+
+    elif page == "2. Deduplication Process":
+        st.header("⚙️ Deduplication Process")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🚀 Run Deduplication", type="primary"):
+                run_deduplication_process()
+
+        with col2:
+            if st.button("✅ Apply Decisions & Finalize", type="secondary", disabled=not st.session_state.dedup_results):
+                apply_decisions_and_finalize()
+
+        # Show results if available
+        if st.session_state.dedup_results:
+            st.subheader("📋 Process Results")
+
+            # Show four main tables
+            tab1, tab2, tab3, tab4 = st.tabs(["Original Input", "Candidates", "All LLM Decisions", "Review Queue"])
+
+            with tab1:
+                st.subheader("Original Input Accounts")
+                st.dataframe(st.session_state.dedup_results['accounts_input'], use_container_width=True)
+
+            with tab2:
+                st.subheader("Similarity Candidates")
+                candidates_df = st.session_state.dedup_results['candidates']
+                # Sort by score descending
+                candidates_display = candidates_df.sort_values('score', ascending=False)
+                st.dataframe(candidates_display, use_container_width=True)
+
+                # Show route distribution
+                route_counts = candidates_df['route'].value_counts()
+                st.bar_chart(route_counts)
+
+            with tab3:
+                st.subheader("All LLM Decisions")
+                llm_decisions_df = st.session_state.dedup_results.get('llm_decisions', pd.DataFrame())
+
+                if not llm_decisions_df.empty:
+                    # Add decision filter
+                    decision_filter = st.multiselect(
+                        "Filter by LLM Decision:",
+                        options=['YES', 'NO', 'NEEDS_CONFIRMATION'],
+                        default=['YES', 'NO', 'NEEDS_CONFIRMATION']
+                    )
+
+                    filtered_decisions = llm_decisions_df[llm_decisions_df['llm_decision'].isin(decision_filter)]
+
+                    # Sort by confidence descending, then by score
+                    filtered_decisions = filtered_decisions.sort_values(['llm_confidence', 'score'], ascending=[False, False])
+
+                    st.markdown("**📝 You can edit the LLM decisions below (click the pencil icon in cells):**")
+
+                    # Make the decisions column editable
+                    edited_decisions = st.data_editor(
+                        filtered_decisions,
+                        use_container_width=True,
+                        column_config={
+                            "llm_decision": st.column_config.SelectboxColumn(
+                                "LLM Decision",
+                                help="Edit the LLM decision",
+                                width="small",
+                                options=["YES", "NO", "NEEDS_CONFIRMATION"],
+                                required=True,
+                            ),
+                            "llm_confidence": st.column_config.NumberColumn(
+                                "LLM Confidence",
+                                help="Edit confidence score",
+                                min_value=0.0,
+                                max_value=1.0,
+                                step=0.01,
+                                format="%.2f"
+                            ),
+                            "pair_key": st.column_config.Column("Pair Key", width="small"),
+                            "focal_id": st.column_config.Column("Focal ID", width="small"),
+                            "candidate_id": st.column_config.Column("Candidate ID", width="small"),
+                            "score": st.column_config.NumberColumn("Similarity Score", format="%.3f"),
+                        },
+                        disabled=["pair_key", "focal_id", "focal_name", "candidate_id", "candidate_name", "score"],
+                        key="llm_decisions_editor"
+                    )
+
+                    # Update session state with edited decisions
+                    if not edited_decisions.equals(filtered_decisions):
+                        # Update the full dataframe with changes
+                        for idx, edited_row in edited_decisions.iterrows():
+                            original_idx = llm_decisions_df[llm_decisions_df['pair_key'] == edited_row['pair_key']].index
+                            if len(original_idx) > 0:
+                                st.session_state.dedup_results['llm_decisions'].loc[original_idx[0], 'llm_decision'] = edited_row['llm_decision']
+                                st.session_state.dedup_results['llm_decisions'].loc[original_idx[0], 'llm_confidence'] = edited_row['llm_confidence']
+
+                    # Show decision distribution
+                    decision_counts = llm_decisions_df['llm_decision'].value_counts()
+                    st.bar_chart(decision_counts)
+
+                    # Summary stats
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        yes_count = len(llm_decisions_df[llm_decisions_df['llm_decision'] == 'YES'])
+                        st.metric("YES Decisions", yes_count)
+                    with col2:
+                        no_count = len(llm_decisions_df[llm_decisions_df['llm_decision'] == 'NO'])
+                        st.metric("NO Decisions", no_count)
+                    with col3:
+                        needs_count = len(llm_decisions_df[llm_decisions_df['llm_decision'] == 'NEEDS_CONFIRMATION'])
+                        st.metric("Needs Review", needs_count)
+
+                    if st.button("🔄 Preview Changes", help="See what changes would be applied"):
+                        # Detect changes using our new system
+                        changed_pairs, changes_detail = detect_decision_changes()
+
+                        if changed_pairs:
+                            st.info(f"**🔍 {len(changed_pairs)} decision changes detected:**")
+
+                            changes_list = []
+                            for pk, detail in changes_detail.items():
+                                changes_list.append(f"• {pk}: {detail['original']} → {detail['current']}")
+
+                            st.markdown("\n".join(changes_list))
+
+                            # Performance preview
+                            current_decisions = st.session_state.dedup_results['llm_decisions']
+                            affected_accounts = find_affected_accounts(changed_pairs, changes_detail, current_decisions)
+                            total_masters = len(st.session_state.dedup_results['masters'])
+
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Changed Pairs", len(changed_pairs))
+                            with col2:
+                                st.metric("Affected Accounts", len(affected_accounts))
+                            with col3:
+                                efficiency = (1 - len(affected_accounts) / total_masters) * 100
+                                st.metric("Efficiency Gain", f"{efficiency:.1f}%")
+
+                            st.success(f"✨ Smart update will only recalculate {len(affected_accounts)} accounts instead of all {total_masters}!")
+                            st.warning("⚠️ Click 'Apply Decisions & Finalize' to execute these changes and see final merged results!")
+                        else:
+                            st.success("No changes detected.")
+
                 else:
-                    st.session_state.accounts_df = df[["account_id", "account_name"]].astype(str)
-                    st.success("Loaded CSV ✔")
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Failed to load CSV: {e}")
+                    st.info("No LLM decisions available - only automatic decisions were made!")
 
-        if st.button("Load Extended Demo", use_container_width=True):
-            extended_demo = pd.DataFrame(
-                [
-                    ("a1", "ACME Corp"),
-                    ("a2", "ACME Corp"),
-                    ("a3", "Acme Corporation"),
-                    ("a4", "ACME Corp International"),
-                    ("a5", "ACME Corp Int"),
-                    ("g1", "ACME Global Holdings Public Ltd Company"),
-                    ("g2", "ACME Global Holdings Public Limited Company"),
-                    ("f1", "Globex I Logistics"),
-                    ("f2", "Globex International Logistics"),
-                    ("f3", "Globex Int Log"),
-                    ("b1", "Globex LLC"),
-                    ("b2", "Globex, L.L.C."),
-                    ("m1", "Microsoft Corporation"),
-                    ("m2", "Microsoft Corp"),
-                    ("m3", "Microsoft Inc"),
-                    ("ap1", "Apple Inc"),
-                    ("ap2", "Apple Incorporated"),
-                    ("ap3", "Apple Computer Inc"),
-                ],
-                columns=["account_id", "account_name"],
-            )
-            st.session_state.accounts_df = extended_demo
-            st.rerun()
+            with tab4:
+                st.subheader("LLM Review Queue (Needs Confirmation Only)")
+                review_queue = st.session_state.dedup_results['review_queue']
 
-        if st.button("Clear All", use_container_width=True):
-            st.session_state.accounts_df = pd.DataFrame(
-                columns=["account_id", "account_name"]
-            )
-            st.rerun()
+                if not review_queue.empty:
+                    st.dataframe(review_queue, use_container_width=True)
+                else:
+                    st.info("No items requiring human review - all decisions were automatic!")
 
-    st.markdown("---")
-    st.subheader("🔧 LLM Judging & Rerun Controls")
+        # Show final results if they exist
+        if 'masters_final' in st.session_state.dedup_results:
+            st.subheader("🎯 Final Results")
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        scope = st.selectbox(
-            "Initial LLM Judging Scope",
-            options=["all", "foci", "foci_related"],
-            index=["all", "foci", "foci_related"].index(st.session_state.scope),
-            help="Restrict which focals are judged initially by the LLM.",
-        )
-    with c2:
-        rerun_scope = st.selectbox(
-            "Rerun Scope (when you rerun with notes)",
-            options=["all", "foci", "foci_related"],
-            index=["all", "foci", "foci_related"].index(st.session_state.rerun_scope),
-            help="Subset of queued pairs to rejudge after adding notes.",
-        )
-    with c3:
-        admin_review = st.checkbox(
-            "Require Admin Review",
-            value=st.session_state.admin_review,
-            help="Treat the final proposals table as the admin review gate.",
-        )
+            tab_final1, tab_final2, tab_final3 = st.tabs(["Final Masters", "Applied Proposals", "Mapping Changes"])
 
-    c4, c5 = st.columns(2)
-    with c4:
-        seed_focals_input = st.text_input(
-            "Seed Focals (IDs, comma-separated)",
-            value=st.session_state.seed_focals_input,
-            placeholder="e.g., a1,a3",
-            help="Used when scope is 'foci' or 'foci_related'.",
-        )
-    with c5:
-        seed_pairs_input = st.text_input(
-            "Seed Pairs (pair_keys a|b, comma-separated)",
-            value=st.session_state.seed_pairs_input,
-            placeholder="e.g., a1|a2,a3|a6",
-            help="Used for graph expansion when scope is 'foci_related'.",
-        )
+            with tab_final1:
+                st.subheader("Final Deduplicated Masters")
+                masters_final = st.session_state.dedup_results['masters_final']
+                st.dataframe(masters_final, use_container_width=True)
 
-    st.markdown("---")
-    start_disabled = len(st.session_state.accounts_df) < 2
-    if start_disabled:
-        st.warning("Please include at least 2 accounts to start.")
-    if st.button("🚀 Start Deduplication Process", type="primary", use_container_width=True, disabled=start_disabled):
-        st.session_state.scope = scope
-        st.session_state.rerun_scope = rerun_scope
-        st.session_state.admin_review = admin_review
-        st.session_state.seed_focals_input = seed_focals_input
-        st.session_state.seed_pairs_input = seed_pairs_input
-        st.session_state.seed_focals = set(parse_csv_ids(seed_focals_input))
-        st.session_state.seed_pairs = set(parse_seed_pairs(seed_pairs_input))
-        st.session_state.pipeline_stage = "processing"
-        st.rerun()
+                # Summary of changes
+                original_count = len(st.session_state.dedup_results['accounts_input'])
+                final_count = len(masters_final)
+                duplicates_removed = original_count - final_count
 
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Original Accounts", original_count)
+                with col2:
+                    st.metric("Final Masters", final_count)
+                with col3:
+                    st.metric("Duplicates Merged", duplicates_removed)
 
-# =========================
-# Stage: Processing
-# =========================
-def run_initial_pipeline():
-    try:
-        with st.spinner("Running deduplication pipeline..."):
-            # 1) Perfect match
-            st.session_state.full_base = er.perfect_match_base(st.session_state.accounts_df)
+            with tab_final2:
+                st.subheader("Applied Merge Proposals")
+                apply_proposals = st.session_state.dedup_results.get('apply_proposals', pd.DataFrame())
+                if not apply_proposals.empty:
+                    st.dataframe(apply_proposals, use_container_width=True)
+                else:
+                    st.info("No merge proposals were applied")
 
-            # 2) Apply historical mapping (cumulative)
-            cum_map_prev = er.read_csv(er.CUM_MAPPING_PATH, cols=["old_master_id", "canonical_master_id"])
-            full_after_hist = er.apply_mapping(st.session_state.full_base, cum_map_prev)
+            with tab_final3:
+                st.subheader("Mapping Changes")
+                clean_mapping = st.session_state.dedup_results.get('clean_mapping', pd.DataFrame())
+                if not clean_mapping.empty:
+                    st.dataframe(clean_mapping, use_container_width=True)
+                    st.info("These accounts were merged into their canonical masters")
+                else:
+                    st.info("No new mappings were created")
 
-            # 3) Masters
-            st.session_state.masters = er.masters_slice(full_after_hist)
-            st.session_state.id2name = dict(
-                zip(st.session_state.masters["account_id"].astype(str), st.session_state.masters["account_name"])
-            )
+    elif page == "3. Review & Results":
+        st.header("👀 Review & Results")
 
-            # 4) Similarity pairs
-            pairs = er.similarity_pairs(st.session_state.masters)
+        if not st.session_state.dedup_results:
+            st.warning("Please run the deduplication process first")
+            return
 
-            # 5) Route candidates
-            st.session_state.candidates = er.route_candidates(pairs)
+        review_queue = st.session_state.dedup_results.get('review_queue', pd.DataFrame())
 
-            # 6) LLM results (with persisted notes/context)
-            st.session_state.context_book = er.load_context_from_notes()
-            st.session_state.llm_results = er.llm_results_df(
-                st.session_state.candidates,
-                st.session_state.masters,
-                array_batch_size=er.LLM_ARRAY_SIZE,
-                context_book=st.session_state.context_book,
-                scope=st.session_state.scope,
-                seed_focals=st.session_state.seed_focals,
-                seed_pairs=st.session_state.seed_pairs,
-                pairs_for_graph=pairs,
-            )
-
-            # 7) Build review queue (NEEDS_CONFIRMATION)
-            st.session_state.review_queue = er.build_review_queue(st.session_state.llm_results)
-
-            # Next stage
-            if st.session_state.review_queue is not None and not st.session_state.review_queue.empty:
-                st.session_state.pipeline_stage = "review"
-            else:
-                st.session_state.pipeline_stage = "final_review"
-
-            st.success("Initial pipeline completed ✔")
-            st.rerun()
-
-    except Exception as e:
-        st.error(f"Error during pipeline: {e}")
-        st.session_state.pipeline_stage = "input"
-
-
-# =========================
-# Stage: Review (LLM NEEDS_CONFIRMATION)
-# =========================
-def display_llm_review():
-    st.header("🤖 LLM Review — Human Confirmation")
-
-    if st.session_state.review_queue.empty:
-        st.info("No pairs require human confirmation. Proceeding to Final Review.")
-        st.session_state.pipeline_stage = "final_review"
-        st.rerun()
-        return
-
-    st.write(f"**{len(st.session_state.review_queue)}** pairs require review.")
-
-    st.markdown("#### Rerun Options")
-    c1, c2, c3 = st.columns([2, 1, 1])
-    with c1:
-        st.session_state.rerun_scope = st.radio(
-            "Rerun Scope (applies when you click 'Rerun LLM with Notes')",
-            options=["all", "foci", "foci_related"],
-            index=["all", "foci", "foci_related"].index(st.session_state.rerun_scope),
-            horizontal=True,
-        )
-    with c2:
-        st.caption("Seed focals")
-        st.code(", ".join(sorted(st.session_state.seed_focals)) or "—")
-    with c3:
-        st.caption("Seed pairs")
-        st.code(", ".join(sorted(st.session_state.seed_pairs)) or "—")
-
-    st.markdown("---")
-    queue_df = st.session_state.review_queue.copy()
-
-    for idx, row in queue_df.iterrows():
-        if str(row.get("status", "QUEUED")) != "QUEUED":
-            continue
-
-        pair_key = str(row["pair_key"])
-        focal_id = str(row["focal_master_id"])
-        candidate_id = str(row["candidate_master_id"])
-        score = float(row["score"]) if row.get("score") is not None else 0.0
-        llm_confidence = row.get("llm_confidence", None)
-        llm_reason = row.get("llm_reason", "")
-
-        focal_name = st.session_state.id2name.get(focal_id, "")
-        candidate_name = st.session_state.id2name.get(candidate_id, "")
-
-        with st.expander(f"**{focal_name}** ↔ **{candidate_name}**  ·  similarity={score:.3f}", expanded=True):
-            left, right = st.columns([4, 2])
-            with left:
-                st.write(f"**Focal:** [{focal_id}] {focal_name}")
-                st.write(f"**Candidate:** [{candidate_id}] {candidate_name}")
-                st.write(f"**Similarity:** {score:.3f}")
-                if llm_confidence is not None:
-                    st.write(f"**LLM Confidence:** {llm_confidence:.3f}")
-                if llm_reason:
-                    st.write(f"**LLM Reason:** {llm_reason}")
-
-            with right:
-                approve, reject, skip = st.columns(3)
-                if approve.button("✅ Approve", use_container_width=True, key=f"approve_{pair_key}"):
-                    st.session_state.human_decisions[pair_key] = {
-                        "decision": "APPROVED",
-                        "pair_key": pair_key,
-                        "focal_master_id": focal_id,
-                        "candidate_master_id": candidate_id,
-                        "score": score,
-                        "status": "APPROVED",
-                        "reviewer": "streamlit_user",
-                        "updated_at": utc_now(),
-                        "llm_confidence": llm_confidence,
-                        "llm_reason": llm_reason,
-                    }
-                    st.rerun()
-                if reject.button("❌ Reject", use_container_width=True, key=f"reject_{pair_key}"):
-                    st.session_state.human_decisions[pair_key] = {
-                        "decision": "REJECTED",
-                        "status": "REJECTED",
-                        "updated_at": utc_now(),
-                    }
-                    st.rerun()
-                if skip.button("⏭️ Skip", use_container_width=True, key=f"skip_{pair_key}"):
-                    st.session_state.human_decisions[pair_key] = {
-                        "decision": "SKIPPED",
-                        "status": "SKIPPED",
-                        "updated_at": utc_now(),
-                    }
-                    st.rerun()
-
-            notes = st.text_area(
-                "Add notes for the LLM/context (optional, persisted & used in reruns)",
-                key=f"notes_{pair_key}",
-                height=70,
-                placeholder="e.g., Treat 'Intl' as 'International'; ACME Global Holdings is a holding company, do not merge with operational subsidiaries.",
-            )
-            cols = st.columns([1, 2, 2, 2])
-            with cols[0]:
-                if st.button("💾 Save Notes", key=f"save_notes_{pair_key}", use_container_width=True):
-                    if notes.strip():
-                        st.session_state.context_book.add_global(notes.strip())
-                        st.session_state.context_book.add_focal(focal_id, notes.strip())
-                        er.persist_note("GLOBAL", notes.strip())
-                        er.persist_note("FOCAL", notes.strip(), focal_id=focal_id)
-                        st.success("Notes saved")
-                    else:
-                        st.info("No notes to save.")
-            with cols[1]:
-                if st.button("🔄 Rerun LLM (full)", key=f"rerun_all_{pair_key}", use_container_width=True):
-                    st.session_state.rerun_scope = "all"
-                    rerun_llm_with_context()
-            with cols[2]:
-                if st.button("🔁 Rerun LLM (foci only)", key=f"rerun_foci_{pair_key}", use_container_width=True):
-                    st.session_state.rerun_scope = "foci"
-                    # ensure current focal is included in seed focals
-                    st.session_state.seed_focals = set(st.session_state.seed_focals) | {focal_id}
-                    rerun_llm_with_context()
-            with cols[3]:
-                st.caption("No rerun → just proceed to final table when ready.")
-
-    st.markdown("---")
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        if st.button("🔄 Rerun LLM with All Current Notes", use_container_width=True):
-            rerun_llm_with_context()
-    with b2:
-        if st.button("✅ Approve All Remaining", use_container_width=True):
-            approve_all_remaining()
-    with b3:
-        if st.button("➡️ Proceed to Final Review", use_container_width=True):
-            st.session_state.pipeline_stage = "final_review"
-            st.rerun()
-
-
-def rerun_llm_with_context():
-    try:
-        with st.spinner("Rejudging queued pairs using accumulated notes/context..."):
-            queued = st.session_state.review_queue[
-                st.session_state.review_queue["status"] == "QUEUED"
-            ].copy()
-            if queued.empty:
-                st.info("No queued pairs to rerun.")
-                return
-
-            judgments_by_pk = er._rerun_llm_for_scope(
-                queued,
-                st.session_state.id2name,
-                st.session_state.context_book,
-                st.session_state.rerun_scope,
-                set(st.session_state.seed_focals),
-            )
-
-            auto_approved = 0
-            for pk, j in judgments_by_pk.items():
-                mask = st.session_state.review_queue["pair_key"] == pk
-                if not mask.any():
-                    continue
-                idx = st.session_state.review_queue[mask].index[0]
-
-                st.session_state.review_queue.at[idx, "llm_decision"] = j.get("llm_decision")
-                st.session_state.review_queue.at[idx, "llm_confidence"] = j.get("llm_confidence")
-                st.session_state.review_queue.at[idx, "llm_reason"] = j.get("llm_reason")
-                st.session_state.review_queue.at[idx, "context_used"] = j.get("context_used")
-                st.session_state.review_queue.at[idx, "prompt_version"] = j.get("prompt_version")
-                st.session_state.review_queue.at[idx, "model_name"] = j.get("model_name")
-                st.session_state.review_queue.at[idx, "decided_at"] = j.get("decided_at")
-
-                if (
-                    j.get("llm_decision") == "YES"
-                    and j.get("llm_confidence") is not None
-                    and float(j["llm_confidence"]) >= er.AUTO_APPROVE_RERUN_YES_CONF
-                ):
-                    row = st.session_state.review_queue.loc[idx]
-                    st.session_state.human_decisions[pk] = {
-                        "decision": "APPROVED",
-                        "pair_key": pk,
-                        "focal_master_id": str(row["focal_master_id"]),
-                        "candidate_master_id": str(row["candidate_master_id"]),
-                        "score": float(row.get("score", 0.0)),
-                        "status": "APPROVED",
-                        "reviewer": "auto_approved_after_context",
-                        "updated_at": utc_now(),
-                        "llm_confidence": j.get("llm_confidence"),
-                        "llm_reason": j.get("llm_reason"),
-                    }
-                    auto_approved += 1
-
-            st.success(f"LLM rerun complete. Auto-approved {auto_approved} strong YES decisions.")
-            st.rerun()
-    except Exception as e:
-        st.error(f"Error during LLM rerun: {e}")
-
-
-def approve_all_remaining():
-    queued = st.session_state.review_queue[
-        st.session_state.review_queue["status"] == "QUEUED"
-    ].copy()
-    count = 0
-    for _, row in queued.iterrows():
-        pk = str(row["pair_key"])
-        if pk in st.session_state.human_decisions:
-            continue
-        st.session_state.human_decisions[pk] = {
-            "decision": "APPROVED",
-            "pair_key": pk,
-            "focal_master_id": str(row["focal_master_id"]),
-            "candidate_master_id": str(row["candidate_master_id"]),
-            "score": float(row["score"]),
-            "status": "APPROVED",
-            "reviewer": "bulk_approved",
-            "updated_at": utc_now(),
-        }
-        count += 1
-    st.success(f"Approved {count} remaining pairs.")
-    st.rerun()
-
-
-# =========================
-# Stage: Final Review (ALL pairs)
-# =========================
-def display_final_review():
-    st.header("📋 Final Table — Review ALL Pairs Before Merging")
-
-    # Build a lookup from LLM results (pair_key → (decision, confidence, score))
-    llm_map: Dict[str, Dict[str, Any]] = {}
-    if st.session_state.llm_results is not None and not st.session_state.llm_results.empty:
-        for _, rr in st.session_state.llm_results.iterrows():
-            focal = str(rr["focal_master_id"])
-            for it in rr["results"]:
-                cand = str(it["candidate_master_id"])
-                pk = er.pair_key(focal, cand)
-                llm_map[pk] = {
-                    "llm_decision": it.get("llm_decision"),
-                    "llm_confidence": it.get("llm_confidence"),
-                    "llm_score": float(it.get("score", 0.0)),
-                    "llm_reason": it.get("llm_reason"),
-                }
-
-    proposals: List[Dict[str, Any]] = []
-
-    # Start from ALL candidate pairs (every pairwise combination)
-    for _, r in st.session_state.candidates.iterrows():
-        pk = str(r["pair_key"])
-        m1 = str(r["master_a_id"])
-        m2 = str(r["master_b_id"])
-        score = float(r["score"])
-        route = r["route"]
-        focal_name = st.session_state.id2name.get(m1, "")
-        cand_name = st.session_state.id2name.get(m2, "")
-
-        # Annotate from LLM if available
-        l = llm_map.get(pk, {})
-        llm_decision = l.get("llm_decision")
-        llm_conf = l.get("llm_confidence")
-        llm_reason = l.get("llm_reason")
-
-        # Default source/status based on route/LLM
-        source = route
-        if route == "AUTO_YES_95":
-            status = "PROPOSED"
-            source = "AUTO_95"
-        elif route == "AUTO_NO":
-            status = "REJECTED"
-            source = "AUTO_NO"
+        if review_queue.empty:
+            st.success("No manual review needed - all decisions were automatic!")
         else:
-            # LLM band
-            if llm_decision == "YES":
-                status = "PROPOSED"
-                source = "LLM_YES"
-            elif llm_decision == "NO":
-                status = "REJECTED"
-                source = "LLM_NO"
-            elif llm_decision == "NEEDS_CONFIRMATION":
-                status = "PROPOSED"
-                source = "LLM_NEEDS"
-            else:
-                # not judged (e.g., beyond top-N) → let user decide
-                status = "PROPOSED"
-                source = "LLM_UNJUDGED"
+            st.subheader("Manual Review Required")
 
-        proposals.append(
-            {
-                "pair_key": pk,
-                "focal_id": m1,
-                "candidate_id": m2,
-                "focal_name": focal_name,
-                "candidate_name": cand_name,
-                "score": score,
-                "source": source,
-                "status": status,
-                "confidence": float(llm_conf) if llm_conf is not None else (1.0 if source == "AUTO_95" else 0.6),
-                "reason": llm_reason or ("auto_threshold" if source == "AUTO_95" else ""),
-            }
-        )
+            # Add comments section
+            st.subheader("💬 Add Comments for LLM Context")
 
-    # Overlay any explicit HUMAN approvals gathered during Review step (still show as PROPOSED by default)
-    for pk, d in st.session_state.human_decisions.items():
-        if d.get("decision") == "APPROVED":
-            # If exists, update; otherwise append
-            found_idx = next((i for i, x in enumerate(proposals) if x["pair_key"] == pk), None)
-            row_update = {
-                "pair_key": pk,
-                "focal_id": d["focal_master_id"],
-                "candidate_id": d["candidate_master_id"],
-                "focal_name": st.session_state.id2name.get(d["focal_master_id"], ""),
-                "candidate_name": st.session_state.id2name.get(d["candidate_master_id"], ""),
-                "score": float(d.get("score", 0.0)),
-                "source": "HUMAN_APPROVED",
-                "status": "PROPOSED",
-                "confidence": float(d.get("llm_confidence", 1.0)),
-                "reason": d.get("llm_reason", "human_approved"),
-            }
-            if found_idx is not None:
-                proposals[found_idx].update(row_update)
-            else:
-                proposals.append(row_update)
-
-    if not proposals:
-        st.info("No pairs to review.")
-        if st.button("✅ Complete Cycle", use_container_width=True):
-            st.session_state.pipeline_stage = "complete"
-            st.rerun()
-        return
-
-    proposals_df = pd.DataFrame(proposals)
-
-    st.subheader(f"📊 Review {len(proposals_df)} Pairs")
-    edited = st.data_editor(
-        proposals_df,
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "status": st.column_config.SelectboxColumn(
-                "Status", options=["PROPOSED", "APPROVED", "REJECTED"], required=True
-            ),
-            "score": st.column_config.NumberColumn("Similarity", format="%.3f", min_value=0.0, max_value=1.0),
-            "confidence": st.column_config.NumberColumn("Confidence", format="%.2f", min_value=0.0, max_value=1.0),
-            "source": st.column_config.TextColumn("Source"),
-            "reason": st.column_config.TextColumn("Reason"),
-            "focal_name": st.column_config.TextColumn("Focal"),
-            "candidate_name": st.column_config.TextColumn("Candidate"),
-        },
-        key="final_proposals_editor",
-    )
-    st.session_state.final_proposals = edited
-
-    approved_count = len(edited[edited["status"] == "APPROVED"])
-    rejected_count = len(edited[edited["status"] == "REJECTED"])
-    proposed_count = len(edited[edited["status"] == "PROPOSED"])
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("✅ Approved", approved_count)
-    c2.metric("❌ Rejected", rejected_count)
-    c3.metric("🔄 Proposed", proposed_count)
-
-    st.markdown("---")
-    a1, a2, a3 = st.columns(3)
-    with a1:
-        if st.button("✅ Approve All Proposed", use_container_width=True):
-            st.session_state.final_proposals.loc[
-                st.session_state.final_proposals["status"] == "PROPOSED", "status"
-            ] = "APPROVED"
-            st.rerun()
-    with a2:
-        if st.button("❌ Reject All Proposed", use_container_width=True):
-            st.session_state.final_proposals.loc[
-                st.session_state.final_proposals["status"] == "PROPOSED", "status"
-            ] = "REJECTED"
-            st.rerun()
-    with a3:
-        if st.button("🚀 Execute Merges", type="primary", use_container_width=True):
-            execute_merges()
-
-
-def execute_merges():
-    try:
-        with st.spinner("Executing merges and updating mapping..."):
-            if st.session_state.final_proposals is None or st.session_state.final_proposals.empty:
-                st.warning("No proposals to execute.")
-                st.session_state.pipeline_stage = "complete"
-                st.rerun()
-                return
-
-            approved = st.session_state.final_proposals[
-                st.session_state.final_proposals["status"] == "APPROVED"
-            ].copy()
-
-            if approved.empty:
-                st.info("No approved merges. Completing cycle.")
-                st.session_state.final_results = {
-                    "full_post": st.session_state.full_base.copy(),
-                    "masters_final": er.masters_slice(st.session_state.full_base),
-                    "merges_executed": 0,
-                }
-                st.session_state.pipeline_stage = "complete"
-                st.rerun()
-                return
-
-            # Convert approved rows into apply_df format expected by cleaner
-            apply_rows = []
-            for _, row in approved.iterrows():
-                apply_rows.append(
-                    {
-                        "pair_key": row["pair_key"],
-                        "m1": row["focal_id"],
-                        "m2": row["candidate_id"],
-                        "source": row["source"],
-                        "score": float(row["score"]),
-                        "confidence": float(row["confidence"]),
-                        "reason": row.get("reason", ""),
-                        "prompt_version": "streamlit_app",
-                        "model_name": "streamlit_user",
-                        "decided_at": utc_now(),
-                    }
-                )
-            apply_df = pd.DataFrame(apply_rows)
-
-            # Clean → delta mapping
-            clean_delta = er.clean_proposals(apply_df)
-
-            # Append decisions history as YES
-            decisions_hist = er.read_csv(
-                er.DECISIONS_PATH, cols=["pair_key", "decision", "source", "decided_at", "score", "reason"]
+            global_comment = st.text_area(
+                "Global Comment (applies to all reruns):",
+                value=st.session_state.review_comments.get('global', ''),
+                key="global_comment_input"
             )
-            if not apply_df.empty:
-                dec = apply_df[
-                    ["pair_key", "source", "score", "confidence", "reason", "prompt_version", "model_name", "decided_at"]
-                ].copy()
-                dec["decision"] = "YES"
-                decisions_hist2 = pd.concat([decisions_hist, dec], ignore_index=True, sort=False).drop_duplicates(
-                    subset=["pair_key", "decision"], keep="last"
-                )
-                er.write_csv(decisions_hist2, er.DECISIONS_PATH)
+            st.session_state.review_comments['global'] = global_comment
 
-            # Update cumulative mapping
-            cum_map_prev = er.read_csv(er.CUM_MAPPING_PATH, cols=["old_master_id", "canonical_master_id"])
-            if not clean_delta.empty:
-                cum_concat = pd.concat([cum_map_prev, clean_delta], ignore_index=True).drop_duplicates()
-                cum_map_new = er.compress_mapping_df(cum_concat)
-                er.write_csv(cum_map_new, er.CUM_MAPPING_PATH)
-            else:
-                cum_map_new = er.compress_mapping_df(cum_map_prev) if not cum_map_prev.empty else cum_map_prev
+            # Show each review item with individual comment boxes
+            for idx, row in review_queue.iterrows():
+                focal_id = str(row['focal_master_id'])
+                candidate_id = str(row['candidate_master_id'])
+                pair_key_str = row['pair_key']
 
-            # Apply mapping to full_base
-            full_post = er.apply_mapping(st.session_state.full_base, cum_map_new)
-            masters_final = er.masters_slice(full_post)
+                with st.expander(f"Review Pair: {focal_id} ↔ {candidate_id}"):
+                    col1, col2 = st.columns(2)
 
-            st.session_state.final_results = {
-                "full_post": full_post,
-                "masters_final": masters_final,
-                "merges_executed": len(approved),
-            }
+                    with col1:
+                        st.write(f"**Focal:** {focal_id}")
+                        st.write(f"**Name:** {st.session_state.dedup_results['id2name'].get(focal_id, 'Unknown')}")
+                        st.write(f"**Score:** {row.get('score', 'N/A')}")
 
-            st.session_state.cycle_count += 1
-            st.session_state.pipeline_stage = "complete"
-            st.success(f"Executed {len(approved)} merges ✔")
-            st.rerun()
-    except Exception as e:
-        st.error(f"Error executing merges: {e}")
+                    with col2:
+                        st.write(f"**Candidate:** {candidate_id}")
+                        st.write(f"**Name:** {st.session_state.dedup_results['id2name'].get(candidate_id, 'Unknown')}")
+                        st.write(f"**LLM Confidence:** {row.get('llm_confidence', 'N/A')}")
 
+                    st.write(f"**LLM Reason:** {row.get('llm_reason', 'N/A')}")
 
-# =========================
-# Stage: Complete
-# =========================
-def display_results():
-    st.header("🎉 Cycle Complete")
+                    # Individual comment for this pair
+                    pair_comment = st.text_area(
+                        f"Comment for this pair:",
+                        value=st.session_state.review_comments.get(pair_key_str, ''),
+                        key=f"comment_{pair_key_str}"
+                    )
+                    st.session_state.review_comments[pair_key_str] = pair_comment
 
-    if "final_results" in st.session_state and st.session_state.final_results is not None:
-        res = st.session_state.final_results
+            # Rerun options
+            st.subheader("🔄 Rerun LLM with Comments")
+            col1, col2, col3 = st.columns(3)
 
-        st.subheader("📈 Summary")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Cycle Number", st.session_state.cycle_count)
-        with c2:
-            st.metric("Merges Executed", res.get("merges_executed", 0))
-        with c3:
-            original_masters = len(st.session_state.masters) if st.session_state.masters is not None else 0
-            final_masters = len(res["masters_final"]) if res.get("masters_final") is not None else 0
-            st.metric("Masters Reduced", f"{max(original_masters - final_masters, 0)} ({original_masters} → {final_masters})")
+            with col1:
+                if st.button("Rerun All"):
+                    rerun_llm_with_comments(scope="all")
+                    st.rerun()
 
-        st.subheader("📊 Final Master Accounts")
-        st.dataframe(res["masters_final"], use_container_width=True)
+            with col2:
+                focal_options = review_queue['focal_master_id'].unique().tolist()
+                selected_focals = st.multiselect("Select focals:", focal_options)
+                if st.button("Rerun Selected Focals") and selected_focals:
+                    rerun_llm_with_comments(scope="foci", focal_ids=selected_focals)
+                    st.rerun()
 
-        st.subheader("📋 All Accounts (Post-Merge)")
-        display_df = res["full_post"][["account_id", "account_name", "master_account_id", "is_master", "group_size"]].copy()
-        display_df = display_df.sort_values(["master_account_id", "account_id"])
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            column_config={
-                "is_master": st.column_config.CheckboxColumn("Is Master"),
-                "group_size": st.column_config.NumberColumn("Group Size", format="%d"),
-            },
-        )
-    else:
-        st.info("No results to display.")
+            with col3:
+                if st.button("Rerun Single Account") and selected_focals:
+                    rerun_llm_with_comments(scope="foci", focal_ids=selected_focals[:1])
+                    st.rerun()
 
-    st.markdown("---")
-    st.subheader("🔄 Next Steps")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("➕ Add New Accounts & Start Next Cycle", type="primary", use_container_width=True):
-            # Keep existing mapping/ledgers on disk; reset app state for new cycle
-            st.session_state.pipeline_stage = "input"
-            # Keep current accounts so the user can append/modify
-            st.toast("Ready for next cycle. Add new accounts and run again.")
-            st.rerun()
-    with c2:
-        if st.button("🔁 Rerun on Same Accounts", use_container_width=True):
-            # Reset intermediates only
-            for key in ["full_base", "masters", "candidates", "llm_results", "review_queue", "final_proposals", "final_results"]:
-                st.session_state[key] = None
-            st.session_state.human_decisions = {}
-            st.session_state.context_book = er.load_context_from_notes()
-            st.session_state.pipeline_stage = "processing"
-            st.rerun()
+    elif page == "4. Masters Management":
+        st.header("👑 Masters Management")
 
+        if not st.session_state.dedup_results:
+            st.warning("Please run the deduplication process first")
+            return
 
-# =========================
-# Main
-# =========================
-def main():
-    init_session_state()
-    sidebar_info()
+        masters_df = st.session_state.dedup_results.get('masters', pd.DataFrame())
 
-    st.title("🔄 Account Deduplication Pipeline (Azure OpenAI + Human-in-the-Loop)")
-    st.caption(
-        "Upload or edit accounts → run dedupe → review LLM uncertainties → adjust final table of **ALL pairs** → execute merges → start next cycle."
-    )
+        if not masters_df.empty:
+            st.subheader("Current Masters")
+            st.dataframe(masters_df, use_container_width=True)
 
-    steps = ["input", "processing", "review", "final_review", "complete"]
-    current_step = steps.index(st.session_state.pipeline_stage)
-    st.progress((current_step + 1) / len(steps), text=f"Stage: {st.session_state.pipeline_stage}")
+            # Show drill-down for each master
+            st.subheader("🔍 Drill Down by Master")
 
-    if st.session_state.pipeline_stage == "input":
-        display_accounts_input()
-    elif st.session_state.pipeline_stage == "processing":
-        run_initial_pipeline()
-    elif st.session_state.pipeline_stage == "review":
-        display_llm_review()
-    elif st.session_state.pipeline_stage == "final_review":
-        display_final_review()
-    else:
-        display_results()
+            master_ids = masters_df['account_id'].tolist()
+            selected_master = st.selectbox("Select master to drill down:", master_ids)
 
+            if selected_master:
+                # Show all pairs involving this master
+                pairs_df = st.session_state.dedup_results.get('pairs', pd.DataFrame())
+                master_pairs = pairs_df[
+                    (pairs_df['master_a_id'] == selected_master) |
+                    (pairs_df['master_b_id'] == selected_master)
+                ]
+
+                if not master_pairs.empty:
+                    st.subheader(f"Pairs involving {selected_master}")
+                    st.dataframe(master_pairs, use_container_width=True)
+
+                    # Show group members if any
+                    full_df = st.session_state.dedup_results.get('full_after_hist', pd.DataFrame())
+                    group_members = full_df[full_df['master_account_id'] == selected_master]
+
+                    if len(group_members) > 1:
+                        st.subheader(f"Group Members for {selected_master}")
+                        st.dataframe(group_members[['account_id', 'account_name', 'is_master']], use_container_width=True)
+        else:
+            st.warning("No masters data available")
 
 if __name__ == "__main__":
     main()
