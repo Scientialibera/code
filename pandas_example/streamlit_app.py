@@ -36,9 +36,11 @@ def init_session_state():
             ("a1", "ACME Corp"),
             ("a2", "ACME Corp"),
             ("a3", "Acme Corporation"),
-            ("a4", "ACME Corp International"),
+            ("a4", "Acme C"),
             ("f1", "Globex International Logistics"),
             ("b1", "Globex, LLC"),
+            ("b2", "Globex Limited Liability Company"),
+            ("b3", "Globex Lim"),
             ("v1", "Unrelated Co"),
             ("x2", "Loblaws Ltd"),
             ("d1", "Microsoft"),
@@ -384,6 +386,58 @@ def run_deduplication_process():
     except Exception as e:
         st.error(f"Error during deduplication: {str(e)}")
 
+def handle_human_decision(pair_key, focal_id, candidate_id, decision, notes=""):
+    """Handle human accept/deny decisions with lineage tracking"""
+    if 'dedup_results' not in st.session_state or not st.session_state.dedup_results:
+        return
+
+    review_queue = st.session_state.dedup_results.get('review_queue', pd.DataFrame())
+
+    if review_queue.empty:
+        return
+
+    # Find the pair in review queue
+    mask = review_queue['pair_key'] == pair_key
+    if not mask.any():
+        return
+
+    idx = review_queue[mask].index[0]
+
+    # Store original decision for lineage
+    original_decision = review_queue.loc[idx, 'llm_decision'] if 'llm_decision' in review_queue.columns else 'NEEDS_CONFIRMATION'
+
+    # Update the review queue with human decision
+    review_queue.loc[idx, 'llm_decision'] = decision
+    review_queue.loc[idx, 'human_decision'] = decision
+    review_queue.loc[idx, 'reviewer'] = os.getenv("USERNAME") or os.getenv("USER") or "streamlit_user"
+    review_queue.loc[idx, 'notes'] = notes
+    review_queue.loc[idx, 'status'] = 'APPROVED' if decision == 'YES' else 'REJECTED'
+    review_queue.loc[idx, 'decision'] = 'HUMAN_APPROVED' if decision == 'YES' else 'HUMAN_REJECTED'
+    review_queue.loc[idx, 'updated_at'] = utc_now()
+
+    # Add lineage tracking
+    if 'rerun_from' not in review_queue.columns:
+        review_queue['rerun_from'] = None
+    if 'human_decision_from' not in review_queue.columns:
+        review_queue['human_decision_from'] = None
+
+    review_queue.loc[idx, 'human_decision_from'] = original_decision
+    review_queue.loc[idx, 'human_decision_at'] = utc_now()
+
+    # Update session state
+    st.session_state.dedup_results['review_queue'] = review_queue
+
+    # Also update LLM decisions dataframe
+    llm_decisions_df = st.session_state.dedup_results.get('llm_decisions', pd.DataFrame())
+    if not llm_decisions_df.empty:
+        llm_mask = llm_decisions_df['pair_key'] == pair_key
+        if llm_mask.any():
+            llm_idx = llm_decisions_df[llm_mask].index[0]
+            llm_decisions_df.loc[llm_idx, 'llm_decision'] = decision
+            llm_decisions_df.loc[llm_idx, 'human_override'] = True
+            llm_decisions_df.loc[llm_idx, 'human_decision_from'] = original_decision
+            st.session_state.dedup_results['llm_decisions'] = llm_decisions_df
+
 def rerun_llm_with_comments(scope="all", focal_ids=None):
     """Rerun LLM with accumulated comments"""
     if 'dedup_results' not in st.session_state or not st.session_state.dedup_results:
@@ -404,28 +458,85 @@ def rerun_llm_with_comments(scope="all", focal_ids=None):
                             st.session_state.context_book.add_focal(focal_id, comment_text)
                             persist_note("FOCAL", comment_text, focal_id)
 
-        # Rerun LLM for the specified scope
+        # Rerun LLM for the specified scope - but only for pairs that still need confirmation
         review_queue = st.session_state.dedup_results['review_queue']
         id2name = st.session_state.dedup_results['id2name']
 
+        # Filter to only pairs that still need confirmation (not human-decided)
+        if 'llm_decision' in review_queue.columns:
+            pending_queue = review_queue[
+                (review_queue['llm_decision'] == 'NEEDS_CONFIRMATION') &
+                (~review_queue.get('human_decision', pd.Series([None] * len(review_queue))).notna())
+            ].copy()
+        else:
+            pending_queue = review_queue.copy()
+
+        if pending_queue.empty:
+            st.info("No pairs remaining that need LLM rerun - all have been decided by human or previous runs.")
+            return
+
         seed_focals = set(focal_ids) if focal_ids else set()
 
-        with st.spinner(f"Rerunning LLM with scope: {scope}..."):
+        with st.spinner(f"Rerunning LLM with scope: {scope} ({len(pending_queue)} pairs remaining)..."):
             judgments_by_pk = _rerun_llm_for_scope(
-                review_queue, id2name, st.session_state.context_book, scope, seed_focals
+                pending_queue, id2name, st.session_state.context_book, scope, seed_focals
             )
 
-            # Update review queue with new judgments
+            # Update review queue with new judgments AND create decision history
             for pk, judgment in judgments_by_pk.items():
                 mask = review_queue['pair_key'] == pk
                 if mask.any():
                     idx = review_queue[mask].index[0]
-                    review_queue.loc[idx, 'llm_decision'] = judgment.get('llm_decision')
+                    # Store original decision for lineage - ALWAYS track this
+                    original_decision = review_queue.loc[idx, 'llm_decision'] if 'llm_decision' in review_queue.columns else 'NEEDS_CONFIRMATION'
+
+                    # Ensure lineage columns exist
+                    if 'rerun_from' not in review_queue.columns:
+                        review_queue['rerun_from'] = None
+                    if 'rerun_at' not in review_queue.columns:
+                        review_queue['rerun_at'] = None
+
+                    # Update with new judgment
+                    new_decision = judgment.get('llm_decision')
+                    review_queue.loc[idx, 'llm_decision'] = new_decision
                     review_queue.loc[idx, 'llm_confidence'] = judgment.get('llm_confidence')
                     review_queue.loc[idx, 'llm_reason'] = judgment.get('llm_reason')
                     review_queue.loc[idx, 'context_used'] = judgment.get('context_used')
 
+                    # ALWAYS set lineage - even if decision didn't change
+                    review_queue.loc[idx, 'rerun_from'] = original_decision
+                    review_queue.loc[idx, 'rerun_at'] = utc_now()
+
+                    # Log the rerun even if decision stayed the same
+                    print(f"DEBUG: Rerun {pk}: {original_decision} → {new_decision} (context: {judgment.get('context_used', 'None')})")
+
             st.session_state.dedup_results['review_queue'] = review_queue
+
+            # Auto-apply decisions if any pairs changed from NEEDS_CONFIRMATION to YES/NO
+            changed_to_decided = [
+                pk for pk, judgment in judgments_by_pk.items()
+                if judgment.get('llm_decision') in ['YES', 'NO']
+            ]
+
+            if changed_to_decided:
+                st.info(f"🔄 {len(changed_to_decided)} pairs resolved - auto-applying decisions...")
+
+                # Update LLM decisions dataframe with new judgments
+                llm_decisions_df = st.session_state.dedup_results.get('llm_decisions', pd.DataFrame())
+                if not llm_decisions_df.empty:
+                    for pk, judgment in judgments_by_pk.items():
+                        mask = llm_decisions_df['pair_key'] == pk
+                        if mask.any():
+                            idx = llm_decisions_df[mask].index[0]
+                            llm_decisions_df.loc[idx, 'llm_decision'] = judgment.get('llm_decision')
+                            llm_decisions_df.loc[idx, 'llm_confidence'] = judgment.get('llm_confidence')
+                            llm_decisions_df.loc[idx, 'llm_reason'] = judgment.get('llm_reason')
+                            llm_decisions_df.loc[idx, 'context_used'] = judgment.get('context_used')
+
+                    st.session_state.dedup_results['llm_decisions'] = llm_decisions_df
+
+                # Auto-apply the decisions
+                apply_decisions_and_finalize()
 
         st.success(f"LLM rerun completed for scope: {scope}")
 
@@ -690,6 +801,71 @@ def main():
         else:
             st.subheader("Manual Review Required")
 
+            # Show comprehensive decision lineage summary
+            st.subheader("📈 Decision History Summary")
+
+            # Collect all decision changes
+            lineage_summary = []
+
+            # Human decisions
+            human_pairs = review_queue[review_queue['human_decision_from'].notna()] if 'human_decision_from' in review_queue.columns else pd.DataFrame()
+            if not human_pairs.empty:
+                for _, row in human_pairs.iterrows():
+                    original = row.get('human_decision_from', 'Unknown')
+                    current = row.get('human_decision', 'Unknown')
+                    pair_key = row['pair_key']
+                    decision_time = row.get('human_decision_at', 'Unknown')
+                    reviewer = row.get('reviewer', 'Unknown')
+
+                    status_icon = "👤✅" if current == 'YES' else "👤❌" if current == 'NO' else "👤🔄"
+                    lineage_summary.append(f"{status_icon} **{pair_key}**: {original} → **{current}** (human decision by {reviewer} at {decision_time})")
+
+            # LLM rerun decisions - show ALL reruns, not just changes
+            rerun_pairs = review_queue[review_queue['rerun_from'].notna()] if 'rerun_from' in review_queue.columns else pd.DataFrame()
+            if not rerun_pairs.empty:
+                for _, row in rerun_pairs.iterrows():
+                    # Skip if this was a human decision
+                    if 'human_decision' in row and pd.notna(row.get('human_decision')):
+                        continue
+
+                    original = row.get('rerun_from', 'Unknown')
+                    current = row.get('llm_decision', 'Unknown')
+                    pair_key = row['pair_key']
+                    rerun_time = row.get('rerun_at', 'Unknown')
+                    context_used = row.get('context_used', '')
+
+                    # Show ALL reruns, indicate if decision changed or stayed same
+                    if original != current:
+                        status_icon = "🤖✅" if current == 'YES' else "🤖❌" if current == 'NO' else "🤖🔄"
+                        change_indicator = "**CHANGED**"
+                    else:
+                        status_icon = "🤖🔄"
+                        change_indicator = "**CONFIRMED**"
+
+                    context_info = f" (with context)" if context_used and context_used.strip() else ""
+                    lineage_summary.append(f"{status_icon} **{pair_key}**: {original} → **{current}** {change_indicator}{context_info} (LLM rerun at {rerun_time})")
+
+            if lineage_summary:
+                st.info("**Recent Decision Changes:**\n" + "\n".join(lineage_summary))
+            else:
+                st.info("No decision changes yet - all pairs are in their original state")
+
+            # Debug section
+            with st.expander("🔧 Debug Info (Click to expand)"):
+                st.write("**Review Queue Columns:**", list(review_queue.columns) if not review_queue.empty else "Empty")
+                if not review_queue.empty:
+                    rerun_count = review_queue['rerun_from'].notna().sum() if 'rerun_from' in review_queue.columns else 0
+                    human_count = review_queue['human_decision'].notna().sum() if 'human_decision' in review_queue.columns else 0
+                    st.write(f"**Pairs with rerun history:** {rerun_count}")
+                    st.write(f"**Pairs with human decisions:** {human_count}")
+                    st.write(f"**Total pairs in queue:** {len(review_queue)}")
+
+                    if 'rerun_from' in review_queue.columns:
+                        rerun_details = review_queue[review_queue['rerun_from'].notna()][['pair_key', 'rerun_from', 'llm_decision', 'rerun_at', 'context_used']]
+                        if not rerun_details.empty:
+                            st.write("**Rerun Details:**")
+                            st.dataframe(rerun_details)
+
             # Add comments section
             st.subheader("💬 Add Comments for LLM Context")
 
@@ -700,34 +876,120 @@ def main():
             )
             st.session_state.review_comments['global'] = global_comment
 
-            # Show each review item with individual comment boxes
-            for idx, row in review_queue.iterrows():
-                focal_id = str(row['focal_master_id'])
-                candidate_id = str(row['candidate_master_id'])
-                pair_key_str = row['pair_key']
+            # Group pairs by current status for better organization
+            if 'llm_decision' in review_queue.columns:
+                # Check for human decisions first
+                if 'human_decision' in review_queue.columns:
+                    queued_pairs = review_queue[
+                        (review_queue['llm_decision'] == 'NEEDS_CONFIRMATION') &
+                        (review_queue['human_decision'].isna())
+                    ]
+                    resolved_pairs = review_queue[
+                        (review_queue['llm_decision'].isin(['YES', 'NO'])) |
+                        (review_queue['human_decision'].notna())
+                    ]
+                else:
+                    queued_pairs = review_queue[review_queue['llm_decision'] == 'NEEDS_CONFIRMATION']
+                    resolved_pairs = review_queue[review_queue['llm_decision'].isin(['YES', 'NO'])]
+            else:
+                # If no llm_decision column, treat all as queued
+                queued_pairs = review_queue.copy()
+                resolved_pairs = pd.DataFrame()
 
-                with st.expander(f"Review Pair: {focal_id} ↔ {candidate_id}"):
-                    col1, col2 = st.columns(2)
+            if not queued_pairs.empty:
+                st.subheader("🔍 Pairs Needing Review")
+                for idx, row in queued_pairs.iterrows():
+                    focal_id = str(row['focal_master_id'])
+                    candidate_id = str(row['candidate_master_id'])
+                    pair_key_str = row['pair_key']
 
-                    with col1:
-                        st.write(f"**Focal:** {focal_id}")
-                        st.write(f"**Name:** {st.session_state.dedup_results['id2name'].get(focal_id, 'Unknown')}")
-                        st.write(f"**Score:** {row.get('score', 'N/A')}")
+                    # Show lineage if this pair was rerun
+                    lineage_info = ""
+                    if 'rerun_from' in row and pd.notna(row['rerun_from']):
+                        lineage_info = f" (Originally: {row['rerun_from']})"
 
-                    with col2:
-                        st.write(f"**Candidate:** {candidate_id}")
-                        st.write(f"**Name:** {st.session_state.dedup_results['id2name'].get(candidate_id, 'Unknown')}")
-                        st.write(f"**LLM Confidence:** {row.get('llm_confidence', 'N/A')}")
+                    with st.expander(f"Review Pair: {focal_id} ↔ {candidate_id}{lineage_info}"):
+                        col1, col2 = st.columns(2)
 
-                    st.write(f"**LLM Reason:** {row.get('llm_reason', 'N/A')}")
+                        with col1:
+                            st.write(f"**Focal:** {focal_id}")
+                            st.write(f"**Name:** {st.session_state.dedup_results['id2name'].get(focal_id, 'Unknown')}")
+                            st.write(f"**Score:** {row.get('score', 'N/A')}")
 
-                    # Individual comment for this pair
-                    pair_comment = st.text_area(
-                        f"Comment for this pair:",
-                        value=st.session_state.review_comments.get(pair_key_str, ''),
-                        key=f"comment_{pair_key_str}"
-                    )
-                    st.session_state.review_comments[pair_key_str] = pair_comment
+                        with col2:
+                            st.write(f"**Candidate:** {candidate_id}")
+                            st.write(f"**Name:** {st.session_state.dedup_results['id2name'].get(candidate_id, 'Unknown')}")
+                            st.write(f"**LLM Confidence:** {row.get('llm_confidence', 'N/A')}")
+
+                        st.write(f"**LLM Reason:** {row.get('llm_reason', 'N/A')}")
+
+                        # Show lineage details if available
+                        if 'rerun_from' in row and pd.notna(row.get('rerun_from')):
+                            current_decision = row.get('llm_decision', 'Unknown')
+                            rerun_time = row.get('rerun_at', 'Unknown')
+                            st.info(f"📋 **Decision History:** {row['rerun_from']} → {current_decision} (rerun at {rerun_time})")
+
+                        # Individual comment for this pair
+                        pair_comment = st.text_area(
+                            f"Comment for this pair:",
+                            value=st.session_state.review_comments.get(pair_key_str, ''),
+                            key=f"comment_{pair_key_str}"
+                        )
+                        st.session_state.review_comments[pair_key_str] = pair_comment
+
+                        # Accept/Deny buttons
+                        st.subheader("👤 Human Decision")
+                        col_accept, col_deny = st.columns(2)
+
+                        with col_accept:
+                            if st.button(f"✅ Accept Merge", key=f"accept_{pair_key_str}"):
+                                handle_human_decision(pair_key_str, focal_id, candidate_id, "YES", pair_comment)
+                                st.success(f"✅ Approved merge for {pair_key_str}")
+                                st.rerun()
+
+                        with col_deny:
+                            if st.button(f"❌ Deny Merge", key=f"deny_{pair_key_str}"):
+                                handle_human_decision(pair_key_str, focal_id, candidate_id, "NO", pair_comment)
+                                st.success(f"❌ Denied merge for {pair_key_str}")
+                                st.rerun()
+
+            if not resolved_pairs.empty:
+                st.subheader("✅ Recently Resolved Pairs")
+
+                # Show resolved pairs with decision source information
+                display_columns = ['pair_key', 'focal_master_id', 'candidate_master_id']
+
+                # Add columns that exist
+                for col in ['llm_decision', 'human_decision', 'llm_confidence', 'rerun_from', 'rerun_at', 'human_decision_from', 'human_decision_at', 'reviewer']:
+                    if col in resolved_pairs.columns:
+                        display_columns.append(col)
+
+                resolved_display = resolved_pairs[display_columns].copy()
+
+                # Add names for display
+                resolved_display['focal_name'] = resolved_display['focal_master_id'].map(st.session_state.dedup_results['id2name'])
+                resolved_display['candidate_name'] = resolved_display['candidate_master_id'].map(st.session_state.dedup_results['id2name'])
+
+                # Add decision source column
+                if 'human_decision' in resolved_display.columns:
+                    resolved_display['decision_source'] = resolved_display.apply(lambda row:
+                        f"👤 Human: {row.get('human_decision', 'N/A')}" if pd.notna(row.get('human_decision'))
+                        else f"🤖 LLM: {row.get('llm_decision', 'N/A')}", axis=1)
+                else:
+                    resolved_display['decision_source'] = resolved_display['llm_decision'].apply(lambda x: f"🤖 LLM: {x}")
+
+                # Add lineage information
+                resolved_display['lineage'] = resolved_display.apply(lambda row:
+                    f"{row.get('human_decision_from', row.get('rerun_from', 'Original'))} → {row.get('human_decision', row.get('llm_decision', 'Unknown'))}", axis=1)
+
+                # Reorder columns for better display
+                final_columns = ['pair_key', 'focal_name', 'candidate_name', 'decision_source', 'lineage']
+                if 'llm_confidence' in resolved_display.columns:
+                    final_columns.append('llm_confidence')
+                if 'reviewer' in resolved_display.columns:
+                    final_columns.append('reviewer')
+
+                st.dataframe(resolved_display[final_columns], use_container_width=True)
 
             # Rerun options
             st.subheader("🔄 Rerun LLM with Comments")
@@ -736,6 +998,7 @@ def main():
             with col1:
                 if st.button("Rerun All"):
                     rerun_llm_with_comments(scope="all")
+                    st.success("Rerun completed! Results updated below.")
                     st.rerun()
 
             with col2:
@@ -743,11 +1006,13 @@ def main():
                 selected_focals = st.multiselect("Select focals:", focal_options)
                 if st.button("Rerun Selected Focals") and selected_focals:
                     rerun_llm_with_comments(scope="foci", focal_ids=selected_focals)
+                    st.success(f"Rerun completed for {len(selected_focals)} focals! Results updated below.")
                     st.rerun()
 
             with col3:
                 if st.button("Rerun Single Account") and selected_focals:
                     rerun_llm_with_comments(scope="foci", focal_ids=selected_focals[:1])
+                    st.success(f"Rerun completed for {selected_focals[0]}! Results updated below.")
                     st.rerun()
 
     elif page == "4. Masters Management":
@@ -757,11 +1022,54 @@ def main():
             st.warning("Please run the deduplication process first")
             return
 
-        masters_df = st.session_state.dedup_results.get('masters', pd.DataFrame())
+        # Show final masters if finalization has been run, otherwise show initial masters
+        if 'masters_final' in st.session_state.dedup_results:
+            masters_df = st.session_state.dedup_results['masters_final']
+            st.subheader("Final Masters (After All Merges)")
+            st.info("✅ These are the final deduplicated masters after applying all decisions")
+        else:
+            masters_df = st.session_state.dedup_results.get('masters', pd.DataFrame())
+            st.subheader("Initial Masters (Before Applying Decisions)")
+            st.warning("⚠️ These are initial masters. Click 'Apply Decisions & Finalize' to see final results.")
 
         if not masters_df.empty:
-            st.subheader("Current Masters")
             st.dataframe(masters_df, use_container_width=True)
+
+            # Show summary of merges applied
+            if 'masters_final' in st.session_state.dedup_results:
+                original_masters = st.session_state.dedup_results.get('masters', pd.DataFrame())
+                if not original_masters.empty:
+                    original_count = len(original_masters)
+                    final_count = len(masters_df)
+                    merged_count = original_count - final_count
+
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Original Masters", original_count)
+                    with col2:
+                        st.metric("Final Masters", final_count)
+                    with col3:
+                        st.metric("Accounts Merged", merged_count, delta=-merged_count if merged_count > 0 else 0)
+
+                    # Show what was merged
+                    if 'clean_mapping' in st.session_state.dedup_results:
+                        clean_mapping = st.session_state.dedup_results['clean_mapping']
+                        if not clean_mapping.empty:
+                            st.subheader("🔗 Applied Merges")
+
+                            # Add account names to the mapping
+                            full_accounts = st.session_state.dedup_results.get('accounts_input', pd.DataFrame())
+                            if not full_accounts.empty:
+                                id2name = dict(zip(full_accounts['account_id'], full_accounts['account_name']))
+
+                                merge_display = clean_mapping.copy()
+                                merge_display['old_account_name'] = merge_display['old_master_id'].map(id2name)
+                                merge_display['canonical_account_name'] = merge_display['canonical_master_id'].map(id2name)
+
+                                st.dataframe(merge_display, use_container_width=True)
+                                st.info(f"📊 {len(clean_mapping)} merge operations were applied")
+                            else:
+                                st.dataframe(clean_mapping, use_container_width=True)
 
             # Show drill-down for each master
             st.subheader("🔍 Drill Down by Master")
@@ -781,13 +1089,33 @@ def main():
                     st.subheader(f"Pairs involving {selected_master}")
                     st.dataframe(master_pairs, use_container_width=True)
 
-                    # Show group members if any
+                # Show group members - use final data if available
+                if 'full_final' in st.session_state.dedup_results:
+                    full_df = st.session_state.dedup_results['full_final']
+                    source_label = "Final Group Members (After All Merges)"
+                else:
                     full_df = st.session_state.dedup_results.get('full_after_hist', pd.DataFrame())
+                    source_label = "Initial Group Members"
+
+                if not full_df.empty:
                     group_members = full_df[full_df['master_account_id'] == selected_master]
 
                     if len(group_members) > 1:
-                        st.subheader(f"Group Members for {selected_master}")
-                        st.dataframe(group_members[['account_id', 'account_name', 'is_master']], use_container_width=True)
+                        st.subheader(f"{source_label} for {selected_master}")
+
+                        # Add group size information
+                        group_size = len(group_members)
+                        master_name = st.session_state.dedup_results['id2name'].get(selected_master, 'Unknown')
+
+                        st.info(f"👥 Master: **{selected_master}** ({master_name}) has **{group_size} accounts** in this group")
+
+                        display_members = group_members[['account_id', 'account_name', 'is_master']].copy()
+                        display_members['role'] = display_members['is_master'].map({True: '👑 Master', False: '📎 Member'})
+
+                        st.dataframe(display_members[['account_id', 'account_name', 'role']], use_container_width=True)
+                    else:
+                        st.info(f"🏠 {selected_master} is a singleton (no other accounts merged with it)")
+
         else:
             st.warning("No masters data available")
 
