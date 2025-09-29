@@ -1,5 +1,5 @@
-# Databricks / Fabric PySpark Notebook 2
-# ======================================
+# Databricks / Fabric PySpark Notebook 2 — Merge → Admin Gate → Clean → Apply → Gold
+# ==============================================================================
 # FINALIZE STAGE (APPEND-ONLY):
 # - Compile final proposals (AUTO_95 + LLM_YES + HUMAN_APPROVED[+AFTER_NOTES])
 # - Apply Admin Gate overrides (APPROVE / REJECT)
@@ -7,6 +7,12 @@
 # - If FINALIZE=true: append decisions_history (YES + NO for admin rejects),
 #   append cumulative mapping deltas, and re-apply effective mapping
 #   (computed in-memory from append-only history) to produce postapply + gold.
+#
+# Safety hardening:
+# - All writes are append-only (partitioned by run_id where applicable).
+# - Handles missing/empty upstream tables gracefully.
+# - De-duplicates by pair_key before persisting.
+# - Uses union-find to produce canonical mapping (transitive merges).
 
 import os, time
 from typing import Dict, List, Tuple
@@ -24,6 +30,7 @@ RUN_ID = os.environ.get("RUN_ID", f"run_{int(time.time())}")
 BASE_DIR = os.environ.get("BASE_DIR", "/lake/dedupe_demo")  # change for Fabric Lakehouse path
 FINALIZE = (os.environ.get("FINALIZE", "false").lower() == "true")
 
+# Optional: auto-approve rerun YES in queue if Notebook 1 emitted such tags
 AUTO_APPROVE_RERUN = os.environ.get("AUTO_APPROVE_RERUN_YES", "true").lower() == "true"
 AUTO_APPROVE_RERUN_YES_CONF = float(os.environ.get("AUTO_APPROVE_RERUN_YES_CONF", "0.9"))
 
@@ -53,11 +60,20 @@ def read_or_empty(tbl_name: str, schema: T.StructType | None = None):
     except Exception:
         return spark.createDataFrame([], schema) if schema else spark.createDataFrame([], T.StructType([]))
 
+
+def ensure_cols(df, cols_with_types: Dict[str, T.DataType]):
+    """Ensure df has the given columns; add nulls with provided types if missing."""
+    for c, t in cols_with_types.items():
+        if c not in df.columns:
+            df = df.withColumn(c, F.lit(None).cast(t))
+    return df
+
 # -----------------
 # Load inputs (scope by RUN_ID where appropriate)
 # -----------------
 
 dec_hist = read_or_empty(DECISIONS_TBL)
+
 cum_map_hist = read_or_empty(CUM_MAPPING_TBL, T.StructType([
     T.StructField("old_master_id", T.StringType()),
     T.StructField("canonical_master_id", T.StringType()),
@@ -105,13 +121,25 @@ auto_df = (sim_cand
         F.lit("auto_threshold").alias("reason"),
         F.lit("auto_threshold").alias("prompt_version"),
         F.lit(None).cast("string").alias("model_name"),
-        F.current_timestamp().alias("decided_at")
+        F.current_timestamp().alias("decided_at"),
+        F.lit(None).cast("double").alias("confidence"),
+        F.lit(None).cast("string").alias("reviewer"),
+        F.lit(None).cast("string").alias("notes"),
     )
     .dropDuplicates(["pair_key"]))
 
 # 2) LLM YES from llm_results (carry prompt metadata)
 llm_exploded = (llm_results
     .select("focal_master_id", "prompt_version", "model_name", "decided_at", F.explode_outer("results").alias("r")))
+
+# Normalize result struct presence
+llm_exploded = ensure_cols(llm_exploded, {
+    "r.llm_confidence": T.DoubleType(),
+    "r.llm_reason": T.StringType(),
+    "r.score": T.DoubleType(),
+    "r.candidate_master_id": T.StringType(),
+    "r.llm_decision": T.StringType(),
+})
 
 llm_yes = (llm_exploded
     .filter(F.col("r.llm_decision") == F.lit("YES"))
@@ -128,12 +156,29 @@ llm_yes = (llm_exploded
         F.col("prompt_version"),
         F.col("model_name"),
         F.col("decided_at"),
-        F.col("r.llm_confidence").alias("confidence")
+        F.col("r.llm_confidence").alias("confidence"),
+        F.lit(None).cast("string").alias("reviewer"),
+        F.lit(None).cast("string").alias("notes"),
     )
     .dropDuplicates(["pair_key"]))
 
-# 3) HUMAN APPROVED from review_queue (keep explicit vs after-notes if present)
-#    If 'decision' column exists, carry it; otherwise default to HUMAN_APPROVED
+# 3) HUMAN APPROVED from review_queue (explicit or after-notes)
+review_q = ensure_cols(review_q, {
+    "pair_key": T.StringType(),
+    "focal_master_id": T.StringType(),
+    "candidate_master_id": T.StringType(),
+    "status": T.StringType(),
+    "score": T.DoubleType(),
+    "llm_reason": T.StringType(),
+    "llm_confidence": T.DoubleType(),
+    "prompt_version": T.StringType(),
+    "model_name": T.StringType(),
+    "updated_at": T.TimestampType(),
+    "reviewer": T.StringType(),
+    "notes": T.StringType(),
+    "decision": T.StringType(),
+})
+
 human_base = (review_q
     .filter(F.col("status") == F.lit("APPROVED"))
     .select(
@@ -199,10 +244,10 @@ proposals_final = (proposals_draft.join(rejects, "pair_key", "left_anti")
 # -----------------
 # Write PREVIEW (append per run)
 # -----------------
-(preview := proposals_final
+preview = (proposals_final
     .withColumn("run_id", F.lit(RUN_ID))
-    .withColumn("preview_at", F.current_timestamp())
-)
+    .withColumn("preview_at", F.current_timestamp()))
+
 (preview
     .write.mode("append").partitionBy("run_id").format("parquet")
     .save(path(PREVIEW_TBL)))

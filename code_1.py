@@ -1,16 +1,17 @@
-# Databricks / Fabric PySpark Notebook 1 — AOAI end-to-end
-# ==========================================================
+# Databricks / Fabric PySpark Notebook 1 — AOAI end-to-end (SAFE)
+# ================================================================
 # Build base tables, apply cumulative mapping, compute similarities,
 # route candidates, prepare AOAI LLM jobs & results (with optional stepped batching),
-# and manage review queue (append-only log; no overwrites). No merges here (Notebook 2 does that).
+# and manage review queue (APPEND-ONLY). No merges here (Notebook 2 does that).
 #
-# Key upgrades vs. prior draft:
-# - Uses Azure OpenAI for BOTH embeddings and LLM judgments (no stubs).
-# - Rerun scopes: ALL (default), FOCAL, or COMPONENT graph of focals connected via queued pairs.
-# - Full prompt metadata tracked end-to-end: model/prompt_version/decided_at + context_used/context_hash + prompt_id + aoai_request_id + token usage.
-# - Strict APPEND-ONLY writes for all tables; consumers can compute latest rows via windowing when needed.
+# Safety features included:
+# - CDC mapping applied BEFORE similarities (clean_proposals_accumulated.silver)
+# - Anti-join pairs against decisions_history.silver (YES only)
+# - Append-only writes with run_id partitioning (snapshots derived downstream)
+# - LLM tool-calling with full metadata and optional rerun scopes (all/focal/component)
+# - Review queue is append-only; reruns append updates, never overwrite
 
-import os, json, math, time, hashlib
+import os, json, math, time, hashlib, re
 from typing import Any, Dict, List, Tuple
 
 from pyspark.sql import SparkSession
@@ -28,11 +29,11 @@ T_AUTO = float(os.environ.get("T_AUTO", "0.95"))          # ≥95% auto-merge ba
 T_LLM_LOW = float(os.environ.get("T_LLM_LOW", "0.70"))    # LLM band lower bound
 LLM_TOP_N = int(os.environ.get("LLM_TOP_N", "3"))         # top-N neighbors kept per focal
 # If batch size < top N, split LLM requests into multiple "jobs" per focal
-LLM_BATCH_SIZE = max(1, int(os.environ.get("LLM_BATCH_SIZE", str(LLM_TOP_N))))  # e.g., 1 → send 1 candidate per request
+LLM_BATCH_SIZE = max(1, int(os.environ.get("LLM_BATCH_SIZE", str(LLM_TOP_N))))
 
 # Rerun scope: 'focal' | 'component' | 'all' (default all)
 RERUN_SCOPE = os.environ.get("RERUN_SCOPE", "all").lower()
-RERUN_FOCALS = [x.strip() for x in os.environ.get("RERUN_FOCALS", "").split(",") if x.strip()]  # optional focal seeds
+RERUN_FOCALS = [x.strip() for x in os.environ.get("RERUN_FOCALS", "").split(",") if x.strip()]
 
 RUN_ID = os.environ.get("RUN_ID", f"run_{int(time.time())}")
 BASE_DIR = os.environ.get("BASE_DIR", "/lake/dedupe_demo")  # change for Fabric Lakehouse path
@@ -67,7 +68,7 @@ def path(table: str) -> str:
     return f"{BASE_DIR}/{table}"
 
 # CDC table names (parquet append-only paths)
-DECISIONS_TBL = "decisions_history.silver"                 # pair_key, source, decided_at
+DECISIONS_TBL = "decisions_history.silver"                 # pair_key, decision, decided_at
 CUM_MAPPING_TBL = "clean_proposals_accumulated.silver"     # old_master_id, canonical_master_id, updated_at
 REVIEW_QUEUE_TBL = "review_queue.silver"                   # append-only log of queue events/updates
 
@@ -85,7 +86,6 @@ def read_or_empty(tbl_name: str, schema: T.StructType | None = None):
         return spark.createDataFrame([], schema) if schema else spark.createDataFrame([], T.StructType([]))
 
 # Lightweight normalizer used upstream of embeddings
-import re
 
 def normalize_name_py(s: str) -> str:
     if s is None:
@@ -135,6 +135,8 @@ class AOAI:
         out: List[List[float]] = []
         for i in range(0, len(texts), batch):
             chunk = texts[i:i+batch]
+            if not chunk:
+                continue
             resp = self.client.embeddings.create(model=self.emb_deploy, input=chunk)
             out.extend([d.embedding for d in resp.data])
         return out
@@ -206,13 +208,12 @@ class AOAI:
         args = json.loads(tool_calls[0].function.arguments or "{}") if tool_calls else {"decisions": []}
         decisions = args.get("decisions", [])
 
-        cand_map = {c["id"]: c for c in candidates}
         out_list = []
         for d in decisions:
             cid = d.get("candidate_master_id")
             if not cid:
                 continue
-            sc = float(d.get("score", cand_map.get(cid, {}).get("score", 0.0)))
+            sc = float(d.get("score", 0.0))
             dec = d.get("decision", "NEEDS_CONFIRMATION")
             conf = float(d.get("confidence", 0.6))
             rea = d.get("reason", "model_decision")
@@ -227,7 +228,7 @@ class AOAI:
 
         meta = {
             "model_name": AOAI_CHAT_DEPLOYMENT,
-            "decided_at": F.current_timestamp(),  # filled later in Spark
+            "decided_at": None,  # set by Spark
             "aoai_request_id": getattr(resp, "id", None),
             "prompt_version": prompt_version,
             "context_used": extra_context or None,
@@ -293,7 +294,10 @@ full = (full.join(grp, "master_account_id")
 # -----------------
 # 3) Apply cumulative mapping BEFORE computing pairs (CDC, append-only)
 # -----------------
-cum_map = inputs["clean_proposals_accumulated.silver"].select("old_master_id","canonical_master_id").dropDuplicates()
+if len(inputs["clean_proposals_accumulated.silver"].columns):
+    cum_map = inputs["clean_proposals_accumulated.silver"].select("old_master_id","canonical_master_id").dropDuplicates()
+else:
+    cum_map = spark.createDataFrame([], "old_master_id string, canonical_master_id string")
 
 full_mapped = (full.alias("f").join(
         cum_map.alias("m"),
@@ -324,9 +328,8 @@ masters_only = (full_mapped.filter(F.col("account_id") == F.col("master_account_
 masters_only.write.mode("append").partitionBy("run_id").format("parquet").save(path("accounts_full_match_filter.silver"))
 
 # -----------------
-# 5) Embeddings + pairs among masters (A<B); anti-join already decided pairs
+# 5) Embeddings + pairs among masters (A<B); anti-join already decided YES pairs
 # -----------------
-# Compute normalized_name (if not present from earlier) and embed using AOAI embeddings on driver in batches.
 masters_for_emb = (masters_only
     .withColumn("normalized_name", normalize_name(F.col("account_name")))
     .select("account_id","normalized_name").dropDuplicates())
@@ -335,7 +338,6 @@ pdf = masters_for_emb.toPandas()
 text_list = pdf["normalized_name"].fillna("").tolist()
 emb_list = _aoai.embed_all(text_list, batch=64)
 
-# Join embeddings back
 pdf_out = pdf.copy()
 pdf_out["embedding"] = emb_list
 
@@ -364,9 +366,11 @@ pairs = (a.crossJoin(b)
     .withColumn("pair_key", F.concat_ws("|", F.col("master_a_id"), F.col("master_b_id")))
     .select("pair_key","master_a_id","master_b_id","score"))
 
-# Remove already-decided pairs this cycle/history
+# Remove already-decided YES pairs (history)
 if len(inputs["decisions_history.silver"].columns):
-    decided_pairs = inputs["decisions_history.silver"].select("pair_key").dropDuplicates()
+    dh = inputs["decisions_history.silver"]
+    decided_pairs = (dh.filter(F.col("decision") == F.lit("YES")) if "decision" in dh.columns else dh)
+    decided_pairs = decided_pairs.select("pair_key").dropDuplicates()
 else:
     decided_pairs = spark.createDataFrame([], "pair_key string")
 
@@ -393,15 +397,13 @@ candidates = (pairs
 candidates.write.mode("append").partitionBy("run_id").format("parquet").save(path("similarity_candidates.silver"))
 
 # -----------------
-# 7) LLM jobs (first pass) — append
-#     Stepped batching via LLM_BATCH_SIZE
+# 7) LLM jobs (first pass) — append; stepped batching via LLM_BATCH_SIZE
 # -----------------
 win = Window.partitionBy("master_a_id").orderBy(F.col("score").desc())
 llm_band = (candidates.filter(F.col("route") == F.lit("LLM"))
     .withColumn("rank", F.row_number().over(win))
     .filter(F.col("rank") <= F.lit(LLM_TOP_N)))
 
-# Compute batch_index per focal using integer division on rank-1
 llm_band = llm_band.withColumn(
     "batch_index",
     F.floor((F.col("rank") - F.lit(1)) / F.lit(LLM_BATCH_SIZE)).cast("int")
@@ -444,20 +446,29 @@ for _, row in jobs_pdf.iterrows():
     )
     results_rows.append({
         "focal_master_id": focal_id,
-        "results": judgments,
+        "results": judgments,  # list[dict]
         "prompt_version": meta["prompt_version"],
         "model_name": meta["model_name"],
         "aoai_request_id": meta.get("aoai_request_id"),
         "token_usage_json": json.dumps(meta.get("token_usage")) if meta.get("token_usage") else None,
-        "context_used": None,
-        "context_hash": _hash12("") ,
+        "context_used": meta.get("context_used"),
+        "context_hash": meta.get("context_hash"),
         "decided_at": None,  # set in Spark below
         "run_id": RUN_ID,
     })
 
-res_schema = T.StructType([
+results_item_schema = T.StructType([
+    T.StructField("candidate_master_id", T.StringType()),
+    T.StructField("score", T.DoubleType()),
+    T.StructField("llm_decision", T.StringType()),
+    T.StructField("llm_confidence", T.DoubleType()),
+    T.StructField("llm_reason", T.StringType()),
+    T.StructField("prompt_version", T.StringType()),
+])
+
+llm_results_schema = T.StructType([
     T.StructField("focal_master_id", T.StringType()),
-    T.StructField("results", T.ArrayType(T.MapType(T.StringType(), T.StringType()))),  # store as array<map> for append simplicity
+    T.StructField("results", T.ArrayType(results_item_schema)),
     T.StructField("prompt_version", T.StringType()),
     T.StructField("model_name", T.StringType()),
     T.StructField("aoai_request_id", T.StringType()),
@@ -468,54 +479,13 @@ res_schema = T.StructType([
     T.StructField("run_id", T.StringType()),
 ])
 
-llm_results_df = spark.createDataFrame(results_rows, schema=res_schema) \
+llm_results_df = spark.createDataFrame(results_rows, schema=llm_results_schema) \
     .withColumn("decided_at", F.current_timestamp())
 
-# Convert array<map> back to array<struct> with expected fields to keep downstream stable
-# (candidate_master_id, score, llm_decision, llm_confidence, llm_reason, prompt_version)
-
-def _map_to_struct(m):
-    return {
-        "candidate_master_id": m.get("candidate_master_id"),
-        "score": F.coalesce(F.col("m.score").cast("double"), F.lit(0.0)),
-        "llm_decision": m.get("llm_decision"),
-        "llm_confidence": F.col("m.llm_confidence").cast("double"),
-        "llm_reason": m.get("llm_reason"),
-        "prompt_version": m.get("prompt_version"),
-    }
-
-# Rebuild results array as array<struct>
-res_exploded = (llm_results_df.select(
-    "focal_master_id","prompt_version","model_name","aoai_request_id","token_usage_json","context_used","context_hash","decided_at","run_id",
-    F.explode_outer("results").alias("m"))
-)
-res_struct = res_exploded.select(
-    "focal_master_id","prompt_version","model_name","aoai_request_id","token_usage_json","context_used","context_hash","decided_at","run_id",
-    F.col("m")["candidate_master_id"].alias("candidate_master_id"),
-    F.col("m")["score"].cast("double").alias("score"),
-    F.col("m")["llm_decision"].alias("llm_decision"),
-    F.col("m")["llm_confidence"].cast("double").alias("llm_confidence"),
-    F.col("m")["llm_reason"].alias("llm_reason"),
-    F.col("m")["prompt_version"].alias("result_prompt_version")
-)
-
-# Group back to the original array<struct>
-llm_results_final = (res_struct.groupBy("focal_master_id","prompt_version","model_name","aoai_request_id","token_usage_json","context_used","context_hash","decided_at","run_id")
-    .agg(F.collect_list(F.struct(
-        F.col("candidate_master_id").alias("candidate_master_id"),
-        F.col("score"),
-        F.col("llm_decision"),
-        F.col("llm_confidence"),
-        F.col("llm_reason")
-    )).alias("results"))
-)
-
-llm_results_final.write.mode("append").partitionBy("run_id").format("parquet").save(path("llm_results.silver"))
+llm_results_df.write.mode("append").partitionBy("run_id").format("parquet").save(path("llm_results.silver"))
 
 # -----------------
-# 7b) OPTIONAL: Rerun LLM for queued pairs with reviewer notes
-#       - Supports per-pair notes (RERUN_NOTES_JSON), per-focal notes (FOCAL_NOTES_JSON), and GLOBAL_NOTES
-#       - Scope: ALL | FOCAL | COMPONENT graph
+# 7b) OPTIONAL: Rerun LLM for queued pairs with reviewer notes (all/focal/component)
 # -----------------
 existing_q = inputs["review_queue.silver"]
 
@@ -523,8 +493,6 @@ if RERUN_ALL or RERUN_PAIR_KEYS or RERUN_FOCALS or RERUN_SCOPE in ("focal","comp
     rq_sel = existing_q
     if len(rq_sel.columns):
         rq_sel = rq_sel.filter(F.col("status") == F.lit("QUEUED"))
-        # Narrow by scope
-        # Build seed node set from focals and/or pair_keys
         seed_nodes = set(RERUN_FOCALS)
         for pk in (RERUN_PAIR_KEYS or []):
             try:
@@ -536,51 +504,44 @@ if RERUN_ALL or RERUN_PAIR_KEYS or RERUN_FOCALS or RERUN_SCOPE in ("focal","comp
         if RERUN_SCOPE == "focal" and seed_nodes:
             rq_sel = rq_sel.where(F.col("focal_master_id").isin(list(seed_nodes)))
         elif RERUN_SCOPE == "component" and seed_nodes:
-            # Compute connected component on driver
             edges = rq_sel.select("focal_master_id","candidate_master_id").distinct().collect()
             adj = {}
             for r in edges:
                 a, b = r["focal_master_id"], r["candidate_master_id"]
                 adj.setdefault(a, set()).add(b)
                 adj.setdefault(b, set()).add(a)
-            seen = set([n for n in seed_nodes if (n in adj or n)])
+            seen = set([n for n in seed_nodes])
             stack = list(seen)
             while stack:
                 v = stack.pop()
-                for nb in adj.get(v, ()):  # BFS
+                for nb in adj.get(v, ( )):
                     if nb not in seen:
                         seen.add(nb); stack.append(nb)
             rq_sel = rq_sel.where(F.col("focal_master_id").isin(list(seen)))
-        # else: default ALL focals in queue
         if RERUN_PAIR_KEYS:
             rq_sel = rq_sel.where(F.col("pair_key").isin(RERUN_PAIR_KEYS))
     else:
         rq_sel = spark.createDataFrame([], "pair_key string, focal_master_id string, candidate_master_id string, score double, notes string, enqueued_at timestamp, updated_at timestamp, status string")
 
-    # Join names for LLM prompt
     with_names = (rq_sel
         .join(masters_only.select(F.col("account_id").alias("focal_master_id"), F.col("account_name").alias("focal_name")), "focal_master_id")
         .join(masters_only.select(F.col("account_id").alias("candidate_master_id"), F.col("account_name").alias("candidate_name")), "candidate_master_id"))
 
-    # Attach optional per-pair notes overrides
     if RERUN_NOTES:
         notes_items = [(k, v) for k, v in RERUN_NOTES.items()]
         notes_df = spark.createDataFrame(notes_items, schema="pair_key string, notes_override string")
         with_names = with_names.join(notes_df, "pair_key", "left")
 
-    # Attach optional per-focal notes
     if FOCAL_NOTES:
         focal_items = [(k, v) for k, v in FOCAL_NOTES.items()]
         focal_df = spark.createDataFrame(focal_items, schema="focal_master_id string, focal_notes string")
         with_names = with_names.join(focal_df, "focal_master_id", "left")
 
-    # Effective notes precedence: pair override > existing 'notes' column > focal-wide notes > GLOBAL_NOTES
     with_names = with_names.withColumn(
         "notes_eff",
         F.coalesce(F.col("notes_override"), F.col("notes"), F.col("focal_notes"), F.lit(GLOBAL_NOTES))
     )
 
-    # Build focal → candidates map on driver
     rerun_pdf = (with_names
                  .select("focal_master_id","focal_name","candidate_master_id","candidate_name","score","notes_eff")
                  .toPandas())
@@ -604,58 +565,26 @@ if RERUN_ALL or RERUN_PAIR_KEYS or RERUN_FOCALS or RERUN_SCOPE in ("focal","comp
             extra_context=(payload["notes"] or ""),
             prompt_version="v2_with_context"
         )
-        for j in judgments:
-            rr_rows.append({
-                "focal_master_id": fid,
-                "candidate_master_id": j["candidate_master_id"],
-                "score": j["score"],
-                "llm_decision": j["llm_decision"],
-                "llm_confidence": j["llm_confidence"],
-                "llm_reason": j["llm_reason"],
-                "prompt_version": meta["prompt_version"],
-                "model_name": meta["model_name"],
-                "aoai_request_id": meta.get("aoai_request_id"),
-                "token_usage_json": json.dumps(meta.get("token_usage")) if meta.get("token_usage") else None,
-                "context_used": meta.get("context_used"),
-                "context_hash": meta.get("context_hash"),
-                "decided_at": None,  # set below
-                "run_id": RUN_ID,
-            })
+        rr_rows.append({
+            "focal_master_id": fid,
+            "results": judgments,
+            "prompt_version": meta["prompt_version"],
+            "model_name": meta["model_name"],
+            "aoai_request_id": meta.get("aoai_request_id"),
+            "token_usage_json": json.dumps(meta.get("token_usage")) if meta.get("token_usage") else None,
+            "context_used": meta.get("context_used"),
+            "context_hash": meta.get("context_hash"),
+            "decided_at": None,
+            "run_id": RUN_ID,
+        })
 
-    rr_schema = T.StructType([
-        T.StructField("focal_master_id", T.StringType()),
-        T.StructField("candidate_master_id", T.StringType()),
-        T.StructField("score", T.DoubleType()),
-        T.StructField("llm_decision", T.StringType()),
-        T.StructField("llm_confidence", T.DoubleType()),
-        T.StructField("llm_reason", T.StringType()),
-        T.StructField("prompt_version", T.StringType()),
-        T.StructField("model_name", T.StringType()),
-        T.StructField("aoai_request_id", T.StringType()),
-        T.StructField("token_usage_json", T.StringType()),
-        T.StructField("context_used", T.StringType()),
-        T.StructField("context_hash", T.StringType()),
-        T.StructField("decided_at", T.TimestampType()),
-        T.StructField("run_id", T.StringType()),
-    ])
-
-    rr_df = spark.createDataFrame(rr_rows, schema=rr_schema).withColumn("decided_at", F.current_timestamp())
-
-    # Append rerun results (as array-of-struct per focal) to llm_results.silver
-    llm_results_rerun = (rr_df.groupBy("focal_master_id","prompt_version","model_name","aoai_request_id","token_usage_json","context_used","context_hash","decided_at","run_id")
-        .agg(F.collect_list(F.struct(
-            F.col("candidate_master_id").alias("candidate_master_id"),
-            F.col("score"),
-            F.col("llm_decision"),
-            F.col("llm_confidence"),
-            F.col("llm_reason")
-        )).alias("results")))
-    llm_results_rerun.write.mode("append").partitionBy("run_id").format("parquet").save(path("llm_results.silver"))
+    if rr_rows:
+        rr_df = spark.createDataFrame(rr_rows, schema=llm_results_schema).withColumn("decided_at", F.current_timestamp())
+        rr_df.write.mode("append").partitionBy("run_id").format("parquet").save(path("llm_results.silver"))
 
 # -----------------
 # 8) Review queue APPEND-ONLY (carry forward; includes first pass + rerun updates)
 # -----------------
-# explode all results for *this RUN_ID* only (first pass + rerun)
 all_llm_results = spark.read.parquet(path("llm_results.silver")).filter(F.col("run_id") == F.lit(RUN_ID))
 
 results_exploded = (all_llm_results
@@ -671,7 +600,6 @@ results_exploded = (all_llm_results
     .withColumn("pair_key", F.concat_ws("|", F.least("focal_master_id","candidate_master_id"), F.greatest("focal_master_id","candidate_master_id")))
 )
 
-# Queue entries to append (NEEDS or borderline)
 queue_increment = (results_exploded.filter(
         (F.col("llm_decision") == F.lit("NEEDS_CONFIRMATION")) |
         ((F.col("llm_decision") == F.lit("YES")) & (F.col("llm_confidence") < F.lit(0.70))) |
@@ -689,17 +617,15 @@ queue_increment = (results_exploded.filter(
     .withColumn("run_id", F.lit(RUN_ID))
 )
 
-# Append new queue entries
 if queue_increment.count() > 0:
     queue_increment.write.mode("append").partitionBy("run_id").format("parquet").save(path(REVIEW_QUEUE_TBL))
 
-# If rerun happened this run, create queue update records (APPEND, not overwrite)
+# If rerun happened this run, append queue update records with possible auto-approval
 if RERUN_ALL or RERUN_PAIR_KEYS or RERUN_FOCALS or RERUN_SCOPE in ("focal","component"):
-    # Derive updates from this run's results_exploded joined to existing queue (to carry reviewer/notes/enqueued_at)
     base_updates = (results_exploded
-        .select("pair_key","focal_master_id","candidate_master_id","score","llm_confidence","llm_reason",
+        .select("pair_key","focal_master_id","candidate_master_id","score","llm_decision","llm_confidence","llm_reason",
                 "prompt_version","model_name","aoai_request_id","token_usage_json","context_used","context_hash","decided_at")
-        .join(existing_q.select("pair_key","reviewer","notes","enqueued_at"), "pair_key", "left"))
+        .join(inputs["review_queue.silver"].select("pair_key","reviewer","notes","enqueued_at"), "pair_key", "left"))
 
     queue_updates = (base_updates
         .withColumn("queue_reason", F.lit("NEEDS_CONFIRMATION"))
@@ -712,4 +638,4 @@ if RERUN_ALL or RERUN_PAIR_KEYS or RERUN_FOCALS or RERUN_SCOPE in ("focal","comp
     if queue_updates.count() > 0:
         queue_updates.write.mode("append").partitionBy("run_id").format("parquet").save(path(REVIEW_QUEUE_TBL))
 
-print(f"[Notebook 1] Completed RUN_ID={RUN_ID}. Wrote/updated tables under {BASE_DIR}. LLM_TOP_N={LLM_TOP_N}, LLM_BATCH_SIZE={LLM_BATCH_SIZE}. RERUN_SCOPE={RERUN_SCOPE}, seeds_focals={RERUN_FOCALS}, selected_pair_keys={RERUN_PAIR_KEYS}")
+print(f"[Notebook 1] Completed RUN_ID={RUN_ID}. Wrote/updated tables under {BASE_DIR}. LLM_TOP_N={LLM_TOP_N}, LLM_BATCH_SIZE={LLM_BATCH_SIZE}. RERUN_SCOPE={RERUN_SCOPE}, seeds_focals={RERUN_FOCALS}, selected_pair_keys={RERUN_PA
