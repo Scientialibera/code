@@ -1251,16 +1251,16 @@ def main():
                 accounts_df = pd.read_csv(DEMO_ACCOUNTS_PATH, dtype=str)
             else:
                 accounts_df = pd.DataFrame([
-                ("a1", "ACME Corp"),
-                ("a2", "ACME Corp"),
-                ("a3", "Acme Corporation"),
-                ("f1", "Globex International Logistics"),
-                ("b1", "Globex, LLC"),
-                ("v1", "Unrelated Co"),
-                ("x2", "Loblaws Ltd"),
-                ("d1", "Microsoft"),
-                ("d2", "Microsoft Corporation"),
-                ], columns=["account_id","account_name"])
+                ("a1", "ACME Corp", "Manufacturing", "New York", "Large", "B2B"),
+                ("a2", "ACME Corp", "Manufacturing", "NY", "Enterprise", "B2B"),
+                ("a3", "Acme Corporation", "Manufacturing", "New York City", "Large", "Business"),
+                ("f1", "Globex International Logistics", "Logistics", "Texas", "Medium", "B2B"),
+                ("b1", "Globex, LLC", "Logistics", "TX", "Medium", "B2B"),
+                ("v1", "Unrelated Co", "Services", "California", "Small", "B2B"),
+                ("x2", "Loblaws Ltd", "Retail", "Canada", "Large", "B2C"),
+                ("d1", "Microsoft", "Technology", "Washington", "Enterprise", "B2B"),
+                ("d2", "Microsoft Corporation", "Software", "WA", "Large", "B2B"),
+                ], columns=["account_id","account_name","industry","location","company_size","business_type"])
                 write_csv(accounts_df, DEMO_ACCOUNTS_PATH)
 
             # Optionally append new rows from CLI
@@ -1275,16 +1275,16 @@ def main():
         else:
             # Ephemeral one-shot demo (original behavior)
             accounts_df = pd.DataFrame([
-                ("a1", "ACME Corp"),
-                ("a2", "ACME Corp"),
-                ("a3", "Acme Corporation"),
-                ("f1", "Globex International Logistics"),
-                ("b1", "Globex, LLC"),
-                ("v1", "Unrelated Co"),
-                ("x2", "Loblaws Ltd"),
-                ("d1", "Microsoft"),
-                ("d2", "Microsoft Corporation"),
-            ], columns=["account_id","account_name"])
+                ("a1", "ACME Corp", "Manufacturing", "New York", "Large", "B2B"),
+                ("a2", "ACME Corp", "Manufacturing", "NY", "Enterprise", "B2B"),
+                ("a3", "Acme Corporation", "Manufacturing", "New York City", "Large", "Business"),
+                ("f1", "Globex International Logistics", "Logistics", "Texas", "Medium", "B2B"),
+                ("b1", "Globex, LLC", "Logistics", "TX", "Medium", "B2B"),
+                ("v1", "Unrelated Co", "Services", "California", "Small", "B2B"),
+                ("x2", "Loblaws Ltd", "Retail", "Canada", "Large", "B2C"),
+                ("d1", "Microsoft", "Technology", "Washington", "Enterprise", "B2B"),
+                ("d2", "Microsoft Corporation", "Software", "WA", "Large", "B2B"),
+            ], columns=["account_id","account_name","industry","location","company_size","business_type"])
 
     # prefer CLI > env defaults
     admin_flag = args.admin_review or ADMIN_REVIEW_DEFAULT
